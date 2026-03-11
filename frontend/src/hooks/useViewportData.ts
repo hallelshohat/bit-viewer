@@ -11,16 +11,17 @@ const CHUNK_SIZE_BYTES = getChunkSizeBytes();
 const MAIN_REQUEST_DEBOUNCE_MS = 40;
 const PREFETCH_DEBOUNCE_MS = 120;
 
-function makeKey(fileId: string, byteOffset: number): string {
-  return `${fileId}:${byteOffset}:${CHUNK_SIZE_BYTES}`;
+function makeKey(resourceKind: string, resourceId: string, byteOffset: number): string {
+  return `${resourceKind}:${resourceId}:${byteOffset}:${CHUNK_SIZE_BYTES}`;
 }
 
 async function loadChunk(
-  fileId: string,
+  resourceKind: string,
+  resourceId: string,
   byteOffset: number,
   signal?: AbortSignal,
 ): Promise<ChunkData> {
-  const key = makeKey(fileId, byteOffset);
+  const key = makeKey(resourceKind, resourceId, byteOffset);
   const cached = chunkCache.get(key);
   if (cached) {
     return cached;
@@ -31,7 +32,7 @@ async function loadChunk(
     return existing;
   }
 
-  const promise = fetchChunk({ fileId, byteOffset, byteLength: CHUNK_SIZE_BYTES, signal })
+  const promise = fetchChunk({ resourceId, resourceKind: resourceKind as 'file' | 'view', byteOffset, byteLength: CHUNK_SIZE_BYTES, signal })
     .then((chunk) => {
       chunkCache.set(key, chunk);
       inflightRequests.delete(key);
@@ -47,11 +48,15 @@ async function loadChunk(
 }
 
 export function useViewportData(params: {
-  fileId: string;
+  resourceId: string;
+  resourceKind: 'file' | 'view';
   fileSizeBytes: number;
+  logicalBitLength: number;
   startRow: number;
   visibleRows: number;
   rowWidthBits: number;
+  groupBitLengths?: number[] | null;
+  useLogicalRowBytes?: boolean;
 }) {
   const [revision, setRevision] = useState(0);
   const [loading, setLoading] = useState(false);
@@ -62,22 +67,24 @@ export function useViewportData(params: {
     () =>
       getRequiredChunkOffsets({
         fileSizeBytes: params.fileSizeBytes,
+        logicalBitLength: params.logicalBitLength,
         startRow: params.startRow,
         visibleRows: params.visibleRows,
         rowWidthBits: params.rowWidthBits,
+        groupBitLengths: params.groupBitLengths ?? undefined,
       }),
-    [params.fileSizeBytes, params.rowWidthBits, params.startRow, params.visibleRows],
+    [params.fileSizeBytes, params.groupBitLengths, params.logicalBitLength, params.rowWidthBits, params.startRow, params.visibleRows],
   );
   const chunkMap = useMemo(() => {
     const map = new Map<number, ChunkData>();
     requiredChunkOffsets.forEach((offset) => {
-      const cached = chunkCache.get(makeKey(params.fileId, offset));
+      const cached = chunkCache.get(makeKey(params.resourceKind, params.resourceId, offset));
       if (cached) {
         map.set(offset, cached);
       }
     });
     return map;
-  }, [params.fileId, requiredChunkOffsets, revision]);
+  }, [params.resourceId, params.resourceKind, requiredChunkOffsets, revision]);
   const missingChunkOffsets = useMemo(
     () => requiredChunkOffsets.filter((offset) => !chunkMap.has(offset)),
     [chunkMap, requiredChunkOffsets],
@@ -87,12 +94,24 @@ export function useViewportData(params: {
     () =>
       buildViewportData({
         fileSizeBytes: params.fileSizeBytes,
+        logicalBitLength: params.logicalBitLength,
         startRow: params.startRow,
         visibleRows: params.visibleRows,
         rowWidthBits: params.rowWidthBits,
         chunks: chunkMap,
+        groupBitLengths: params.groupBitLengths ?? undefined,
+        useLogicalRowBytes: params.useLogicalRowBytes ?? false,
       }),
-    [chunkMap, params.fileSizeBytes, params.rowWidthBits, params.startRow, params.visibleRows],
+    [
+      chunkMap,
+      params.fileSizeBytes,
+      params.groupBitLengths,
+      params.logicalBitLength,
+      params.rowWidthBits,
+      params.startRow,
+      params.useLogicalRowBytes,
+      params.visibleRows,
+    ],
   );
 
   useEffect(() => {
@@ -108,7 +127,11 @@ export function useViewportData(params: {
     setError(null);
 
     const requestTimer = window.setTimeout(() => {
-      Promise.all(missingChunkOffsets.map((offset) => loadChunk(params.fileId, offset, controller.signal)))
+      Promise.all(
+        missingChunkOffsets.map((offset) =>
+          loadChunk(params.resourceKind, params.resourceId, offset, controller.signal),
+        ),
+      )
         .then(() => {
           if (requestId.current !== currentRequest) {
             return;
@@ -129,7 +152,7 @@ export function useViewportData(params: {
       controller.abort();
       window.clearTimeout(requestTimer);
     };
-  }, [missingChunkOffsets, params.fileId]);
+  }, [missingChunkOffsets, params.resourceId, params.resourceKind]);
 
   useEffect(() => {
     if (requiredChunkOffsets.length === 0) {
@@ -144,14 +167,14 @@ export function useViewportData(params: {
 
     const prefetchTimer = window.setTimeout(() => {
       prefetchOffsets.forEach((offset) => {
-        void loadChunk(params.fileId, offset).catch(() => undefined);
+        void loadChunk(params.resourceKind, params.resourceId, offset).catch(() => undefined);
       });
     }, PREFETCH_DEBOUNCE_MS);
 
     return () => {
       window.clearTimeout(prefetchTimer);
     };
-  }, [params.fileId, params.fileSizeBytes, requiredChunkOffsets]);
+  }, [params.fileSizeBytes, params.resourceId, params.resourceKind, requiredChunkOffsets]);
 
   return { data, loading, error };
 }

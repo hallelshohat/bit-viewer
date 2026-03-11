@@ -15,9 +15,10 @@ def test_chunk_endpoint_returns_requested_slice(tmp_path) -> None:
             fileId="chunk-file",
             filename="chunk.bin",
             sizeBytes=6,
+            logicalBitLength=48,
             createdAt=datetime.now(timezone.utc),
         )
-        (tmp_path / "chunk-file.bin").write_bytes(b"ABCDEF")
+        (tmp_path / "files" / "chunk-file.bin").write_bytes(b"ABCDEF")
         test_store._write_metadata(metadata)
 
         response = main_module.get_chunk(

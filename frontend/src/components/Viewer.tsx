@@ -2,11 +2,12 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 
 import { clamp, formatOffset } from '../lib/format';
 import { useViewportData } from '../hooks/useViewportData';
-import type { FileMetadata, JumpRequest, ViewportRow } from '../types';
+import { getRowIndexForBitOffset, getRowSourceBitOffset, getTotalRows } from '../lib/viewport';
+import type { JumpRequest, ViewerResource, ViewportRow } from '../types';
 import { BitCanvas } from './BitCanvas';
 
 interface ViewerProps {
-  file: FileMetadata;
+  resource: ViewerResource;
   rowWidthBits: number;
   bitSize: number;
   jumpRequest: JumpRequest | null;
@@ -23,14 +24,21 @@ function renderOffset(row: ViewportRow): string {
   return `${formatOffset(row.byteOffsetStart)}  ${row.hex}`;
 }
 
-export function Viewer({ file, rowWidthBits, bitSize, jumpRequest, onVisibleOffsetsChange }: ViewerProps) {
+export function Viewer({ resource, rowWidthBits, bitSize, jumpRequest, onVisibleOffsetsChange }: ViewerProps) {
   const bitRef = useRef<HTMLDivElement | null>(null);
   const hexRef = useRef<HTMLDivElement | null>(null);
   const asciiRef = useRef<HTMLDivElement | null>(null);
   const syncSource = useRef<PaneKind | null>(null);
   const textRowHeight = Math.max(bitSize, MIN_TEXT_ROW_HEIGHT);
 
-  const totalRows = Math.max(1, Math.ceil((file.sizeBytes * 8) / rowWidthBits));
+  const totalRows = Math.max(
+    1,
+    getTotalRows({
+      logicalBitLength: resource.logicalBitLength,
+      rowWidthBits,
+      groupBitLengths: resource.groupBitLengths ?? undefined,
+    }),
+  );
   const bitTotalHeight = totalRows * bitSize;
   const textTotalHeight = totalRows * textRowHeight;
   const visibleRowCount = Math.min(totalRows, Math.ceil(VIEWER_HEIGHT / bitSize) + OVERSCAN_ROWS * 2);
@@ -51,19 +59,28 @@ export function Viewer({ file, rowWidthBits, bitSize, jumpRequest, onVisibleOffs
   }, [scrollRowPosition, totalRows, visibleRowCount]);
 
   const { data, loading, error } = useViewportData({
-    fileId: file.fileId,
-    fileSizeBytes: file.sizeBytes,
+    resourceId: resource.resourceId,
+    resourceKind: resource.resourceKind,
+    fileSizeBytes: resource.sizeBytes,
+    logicalBitLength: resource.logicalBitLength,
     startRow,
     visibleRows: visibleRowCount,
     rowWidthBits,
+    groupBitLengths: resource.groupBitLengths ?? undefined,
+    useLogicalRowBytes: resource.isFiltered,
   });
   const bitTopOffset = startRow * bitSize;
   const textTopOffset = startRow * textRowHeight;
 
   useEffect(() => {
-    const visibleBitOffset = Math.floor(scrollRowPosition) * rowWidthBits;
+    const visibleBitOffset = getRowSourceBitOffset({
+      logicalBitLength: resource.logicalBitLength,
+      rowWidthBits,
+      rowIndex: Math.floor(scrollRowPosition),
+      groupBitLengths: resource.groupBitLengths ?? undefined,
+    });
     onVisibleOffsetsChange(visibleBitOffset, Math.floor(visibleBitOffset / 8), data?.actualRows ?? 0);
-  }, [data?.actualRows, onVisibleOffsetsChange, rowWidthBits, scrollRowPosition]);
+  }, [data?.actualRows, onVisibleOffsetsChange, resource.groupBitLengths, resource.logicalBitLength, rowWidthBits, scrollRowPosition]);
 
   useEffect(() => {
     if (!jumpRequest) {
@@ -71,9 +88,13 @@ export function Viewer({ file, rowWidthBits, bitSize, jumpRequest, onVisibleOffs
     }
 
     const targetBitOffset = jumpRequest.mode === 'byte' ? jumpRequest.value * 8 : jumpRequest.value;
-    const targetRow = Math.floor(targetBitOffset / rowWidthBits);
+    const targetRow = getRowIndexForBitOffset({
+      bitOffset: targetBitOffset,
+      rowWidthBits,
+      groupBitLengths: resource.groupBitLengths ?? undefined,
+    });
     syncScroll('bit', targetRow);
-  }, [jumpRequest, rowWidthBits]);
+  }, [jumpRequest, resource.groupBitLengths, rowWidthBits]);
 
   function syncScroll(source: PaneKind, nextScrollRow: number) {
     if (syncSource.current && syncSource.current !== source) {

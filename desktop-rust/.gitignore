@@ -1,0 +1,10 @@
+target/
+
+# Cargo local overrides
+.cargo/
+
+# IDE/editor files
+.idea/
+.vscode/
+*.swp
+*.swo

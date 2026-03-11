@@ -1,4 +1,13 @@
-import type { ChunkData, UploadResponse, ViewportResponse } from './types';
+import type {
+  ChunkData,
+  FilterConfig,
+  FilterJobResponse,
+  FilterJobStatus,
+  ResourceKind,
+  UploadResponse,
+  ViewMetadata,
+  ViewportResponse,
+} from './types';
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? '';
 
@@ -39,7 +48,8 @@ export async function fetchViewport(params: {
 }
 
 export async function fetchChunk(params: {
-  fileId: string;
+  resourceId: string;
+  resourceKind: ResourceKind;
   byteOffset: number;
   byteLength: number;
   signal?: AbortSignal;
@@ -48,7 +58,8 @@ export async function fetchChunk(params: {
     byteOffset: String(params.byteOffset),
     byteLength: String(params.byteLength),
   });
-  const response = await fetch(`${API_BASE}/api/files/${params.fileId}/chunk?${query.toString()}`, {
+  const prefix = params.resourceKind === 'file' ? 'files' : 'views';
+  const response = await fetch(`${API_BASE}/api/${prefix}/${params.resourceId}/chunk?${query.toString()}`, {
     signal: params.signal,
   });
   if (!response.ok) {
@@ -58,9 +69,35 @@ export async function fetchChunk(params: {
 
   const arrayBuffer = await response.arrayBuffer();
   return {
-    fileId: params.fileId,
+    resourceId: params.resourceId,
+    resourceKind: params.resourceKind,
     byteOffset: Number(response.headers.get('X-Byte-Offset') ?? params.byteOffset),
     byteLength: arrayBuffer.byteLength,
     data: new Uint8Array(arrayBuffer),
   };
+}
+
+export async function createFilterJob(fileId: string, config: FilterConfig): Promise<FilterJobResponse> {
+  const response = await fetch(`${API_BASE}/api/files/${fileId}/filters`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(config),
+  });
+  return parseJson<FilterJobResponse>(response);
+}
+
+export async function fetchFilterJob(jobId: string, signal?: AbortSignal): Promise<FilterJobStatus> {
+  const response = await fetch(`${API_BASE}/api/filter-jobs/${jobId}`, {
+    signal,
+  });
+  return parseJson<FilterJobStatus>(response);
+}
+
+export async function fetchViewMetadata(viewId: string, signal?: AbortSignal): Promise<ViewMetadata> {
+  const response = await fetch(`${API_BASE}/api/views/${viewId}/metadata`, {
+    signal,
+  });
+  return parseJson<ViewMetadata>(response);
 }

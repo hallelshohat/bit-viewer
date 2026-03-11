@@ -10,6 +10,7 @@ def make_metadata(size_bytes: int) -> FileMetadata:
         fileId="file-1",
         filename="sample.bin",
         sizeBytes=size_bytes,
+        logicalBitLength=size_bytes * 8,
         createdAt=datetime.now(timezone.utc),
     )
 
@@ -52,7 +53,7 @@ def test_build_viewport_response_handles_non_byte_aligned_rows() -> None:
 def test_metadata_round_trip_is_json_serializable(tmp_path) -> None:
     store = FileStore(tmp_path)
     metadata = make_metadata(size_bytes=6)
-    (tmp_path / f"{metadata.file_id}.bin").write_bytes(b"ABCDEF")
+    (tmp_path / "files" / f"{metadata.file_id}.bin").write_bytes(b"ABCDEF")
 
     store._write_metadata(metadata)
     restored = store.get_metadata(metadata.file_id)
@@ -60,3 +61,4 @@ def test_metadata_round_trip_is_json_serializable(tmp_path) -> None:
     assert restored.file_id == metadata.file_id
     assert restored.filename == metadata.filename
     assert restored.size_bytes == metadata.size_bytes
+    assert restored.logical_bit_length == metadata.logical_bit_length
