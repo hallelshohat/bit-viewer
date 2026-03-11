@@ -11,7 +11,7 @@ use rfd::FileDialog;
 
 use crate::document::BinaryDocument;
 use crate::filters::{DerivedView, FilterPipeline, FilterStep, build_derived_view};
-use crate::viewer::{bit_offset_to_row, build_bit_rows, build_row, build_row_layout};
+use crate::viewer::{bit_offset_to_row, build_bit_window, build_row, build_row_layout};
 
 const DEFAULT_ROW_WIDTH_BITS: usize = 128;
 const MIN_ROW_WIDTH_BITS: usize = 8;
@@ -23,6 +23,7 @@ const ROW_WIDTH_STEP_BITS: usize = 1;
 const BIT_SIZE_STEP: f32 = 1.0;
 const TEXT_ROW_HEIGHT: f32 = 20.0;
 const BIT_OVERSCAN_ROWS: usize = 24;
+const BIT_OVERSCAN_COLS: usize = 32;
 const TEXT_OVERSCAN_ROWS: usize = 8;
 const SCROLL_MULTIPLIER: Vec2 = Vec2::new(1.5, 2.5);
 const BIT_ONE_COLOR: Color32 = Color32::from_rgb(32, 96, 246);
@@ -46,6 +47,8 @@ struct BitTextureKey {
     row_width_bits: usize,
     start_row: usize,
     row_count: usize,
+    start_col: usize,
+    col_count: usize,
 }
 
 pub struct BitViewerApp {
@@ -560,22 +563,35 @@ impl BitViewerApp {
                         let viewport_start_row =
                             (viewport.min.y / bit_row_height).floor().max(0.0) as usize;
                         let viewport_end_row = (viewport.max.y / bit_row_height).ceil() as usize;
+                        let viewport_start_col =
+                            (viewport.min.x / self.bit_size).floor().max(0.0) as usize;
+                        let viewport_end_col =
+                            (viewport.max.x / self.bit_size).ceil().max(0.0) as usize;
                         let cache_start_row = viewport_start_row.saturating_sub(BIT_OVERSCAN_ROWS);
                         let cache_end_row = (viewport_end_row + BIT_OVERSCAN_ROWS).min(total_rows);
                         let cache_row_count = cache_end_row.saturating_sub(cache_start_row);
+                        let cache_start_col = viewport_start_col.saturating_sub(BIT_OVERSCAN_COLS);
+                        let cache_end_col =
+                            (viewport_end_col + BIT_OVERSCAN_COLS).min(self.row_width_bits);
+                        let cache_col_count = cache_end_col.saturating_sub(cache_start_col);
 
                         if let Some(texture_id) = self.ensure_bit_texture(
                             ui.ctx(),
                             &layout,
                             cache_start_row,
                             cache_row_count,
+                            cache_start_col,
+                            cache_col_count,
                         ) {
                             let cache_rect = Rect::from_min_size(
                                 egui::pos2(
-                                    ui.max_rect().left(),
+                                    ui.max_rect().left() + cache_start_col as f32 * self.bit_size,
                                     ui.max_rect().top() + cache_start_row as f32 * bit_row_height,
                                 ),
-                                Vec2::new(bit_panel_width, cache_row_count as f32 * bit_row_height),
+                                Vec2::new(
+                                    cache_col_count as f32 * self.bit_size,
+                                    cache_row_count as f32 * bit_row_height,
+                                ),
                             );
                             ui.painter().image(
                                 texture_id,
@@ -586,7 +602,8 @@ impl BitViewerApp {
                             paint_bit_grid_lines(
                                 ui,
                                 cache_rect,
-                                self.row_width_bits,
+                                cache_start_col,
+                                cache_col_count,
                                 cache_row_count,
                                 self.bit_size,
                                 bit_row_height,
@@ -656,8 +673,10 @@ impl BitViewerApp {
         layout: &crate::viewer::RowLayout,
         start_row: usize,
         row_count: usize,
+        start_col: usize,
+        col_count: usize,
     ) -> Option<egui::TextureId> {
-        if row_count == 0 || self.row_width_bits == 0 {
+        if row_count == 0 || col_count == 0 || self.row_width_bits == 0 {
             return None;
         }
 
@@ -668,10 +687,13 @@ impl BitViewerApp {
             row_width_bits: self.row_width_bits,
             start_row,
             row_count,
+            start_col,
+            col_count,
         };
 
         if self.bit_texture_key != Some(key) {
-            let bit_values = build_bit_rows(view, layout, start_row, row_count);
+            let bit_values =
+                build_bit_window(view, layout, start_row, row_count, start_col, col_count);
             let pixels = bit_values
                 .into_iter()
                 .map(|bit| {
@@ -682,7 +704,7 @@ impl BitViewerApp {
                     }
                 })
                 .collect::<Vec<_>>();
-            let image = egui::ColorImage::new([self.row_width_bits, row_count], pixels);
+            let image = egui::ColorImage::new([col_count, row_count], pixels);
 
             if let Some(texture) = &mut self.bit_texture {
                 texture.set(image, egui::TextureOptions::NEAREST);
@@ -983,7 +1005,8 @@ impl BitViewerApp {
 fn paint_bit_grid_lines(
     ui: &mut Ui,
     rect: Rect,
-    row_width_bits: usize,
+    start_col: usize,
+    col_count: usize,
     row_count: usize,
     bit_size: f32,
     row_height: f32,
@@ -992,8 +1015,9 @@ fn paint_bit_grid_lines(
     let top = rect.top();
     let left = rect.left();
 
-    for bit_index in 0..=row_width_bits {
-        let x = left + bit_index as f32 * bit_size;
+    for bit_offset in 0..=col_count {
+        let bit_index = start_col + bit_offset;
+        let x = left + bit_offset as f32 * bit_size;
         let stroke = if bit_index > 0 && bit_index % 8 == 0 {
             Stroke::new(1.5, BYTE_DIVIDER_COLOR)
         } else {

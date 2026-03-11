@@ -85,13 +85,19 @@ pub fn build_row(view: &DerivedView, layout: &RowLayout, row_index: usize) -> Ro
     RowData { hex, ascii }
 }
 
-pub fn build_bit_rows(
+pub fn build_bit_window(
     view: &DerivedView,
     layout: &RowLayout,
     start_row: usize,
     row_count: usize,
+    start_col: usize,
+    col_count: usize,
 ) -> Vec<u8> {
-    let mut bitmap = vec![0; row_count.saturating_mul(layout.row_width_bits)];
+    let mut bitmap = vec![0; row_count.saturating_mul(col_count)];
+
+    if col_count == 0 {
+        return bitmap;
+    }
 
     for row_offset in 0..row_count {
         let row_index = start_row + row_offset;
@@ -105,10 +111,16 @@ pub fn build_bit_rows(
             .len_bits()
             .saturating_sub(start_bit)
             .min(layout.row_width_bits);
-        let row_start = row_offset.saturating_mul(layout.row_width_bits);
+        if start_col >= bits_to_take {
+            continue;
+        }
 
-        for bit_offset in 0..bits_to_take {
-            bitmap[row_start + bit_offset] = group.bit(start_bit + bit_offset).unwrap_or(0);
+        let row_start = row_offset.saturating_mul(col_count);
+        let visible_bits = bits_to_take.saturating_sub(start_col).min(col_count);
+
+        for bit_offset in 0..visible_bits {
+            bitmap[row_start + bit_offset] =
+                group.bit(start_bit + start_col + bit_offset).unwrap_or(0);
         }
     }
 
