@@ -17,6 +17,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Bit Viewer Desktop",
         options,
-        Box::new(|_cc| Ok(Box::<BitViewerApp>::default())),
+        Box::new(|cc| Ok(Box::new(BitViewerApp::new(cc)))),
     )
 }

@@ -1,1 +1,0 @@
-{"root":["./src/App.tsx","./src/api.ts","./src/main.tsx","./src/types.ts","./src/vite-env.d.ts","./src/components/BitCanvas.tsx","./src/components/FileUpload.tsx","./src/components/SettingsPanel.tsx","./src/components/Viewer.tsx","./src/hooks/useViewportData.ts","./src/lib/format.ts","./src/lib/lru.ts","./src/lib/viewport.ts"],"version":"5.9.3"}

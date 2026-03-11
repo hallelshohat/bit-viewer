@@ -1,6 +1,2 @@
-__pycache__/
-.pytest_cache/
-backend/uploads/
-backend/.venv/
-frontend/node_modules/
-frontend/dist/
+desktop-rust/target/
+.DS_Store

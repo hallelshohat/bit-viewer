@@ -1,4 +1,0 @@
-fastapi==0.115.12
-python-multipart==0.0.20
-uvicorn[standard]==0.33.0
-pytest==8.3.5

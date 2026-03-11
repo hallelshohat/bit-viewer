@@ -4,8 +4,8 @@ use std::thread;
 use std::time::Duration;
 
 use eframe::egui::{
-    self, Align, Color32, Context, FontFamily, FontId, Key, Layout, Rect, RichText, ScrollArea,
-    Stroke, TextureHandle, Ui, Vec2,
+    self, Align, Color32, Context, CornerRadius, FontFamily, FontId, Key, Layout, Rect, RichText,
+    ScrollArea, Stroke, TextureHandle, Ui, Vec2,
 };
 use rfd::FileDialog;
 
@@ -30,11 +30,24 @@ const BIT_ONE_COLOR: Color32 = Color32::from_rgb(32, 96, 246);
 const BIT_ZERO_COLOR: Color32 = Color32::WHITE;
 const BIT_BORDER_COLOR: Color32 = Color32::from_gray(200);
 const BYTE_DIVIDER_COLOR: Color32 = Color32::from_rgb(220, 48, 48);
-const PANEL_FILL: Color32 = Color32::from_rgb(248, 249, 252);
+const APP_BG: Color32 = Color32::from_rgb(8, 12, 20);
+const SIDEBAR_BG: Color32 = Color32::from_rgb(12, 18, 30);
+const SURFACE_BG: Color32 = Color32::from_rgb(18, 24, 38);
+const SURFACE_ALT_BG: Color32 = Color32::from_rgb(23, 31, 48);
+const SURFACE_SUBTLE_BG: Color32 = Color32::from_rgb(28, 38, 58);
+const BORDER_COLOR: Color32 = Color32::from_rgb(46, 62, 92);
+const ACCENT_COLOR: Color32 = Color32::from_rgb(76, 183, 255);
+const ACCENT_SOFT: Color32 = Color32::from_rgb(34, 82, 128);
+const TEXT_PRIMARY: Color32 = Color32::from_rgb(236, 242, 255);
+const TEXT_MUTED: Color32 = Color32::from_rgb(147, 163, 188);
+const ERROR_COLOR: Color32 = Color32::from_rgb(255, 119, 119);
 const HEX_COLUMN_MIN_WIDTH: f32 = 280.0;
 const ASCII_COLUMN_MIN_WIDTH: f32 = 120.0;
-const TEXT_PANEL_WIDTH: f32 = 540.0;
+const BIT_PANEL_MIN_WIDTH: f32 = 240.0;
+const HEX_PANEL_DEFAULT_WIDTH: f32 = 360.0;
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+const SIDEBAR_WIDTH: f32 = 360.0;
+const TEXT_CELL_PADDING_X: f32 = 10.0;
 
 struct DerivedBuildResult {
     request_id: u64,
@@ -60,7 +73,9 @@ pub struct BitViewerApp {
     bit_texture_key: Option<BitTextureKey>,
     derived_view_revision: u64,
     row_width_bits: usize,
+    target_row_width_bits: usize,
     bit_size: f32,
+    target_bit_size: f32,
     jump_bit_input: String,
     jump_byte_input: String,
     path_input: String,
@@ -88,7 +103,9 @@ impl Default for BitViewerApp {
             bit_texture_key: None,
             derived_view_revision: 0,
             row_width_bits: DEFAULT_ROW_WIDTH_BITS,
+            target_row_width_bits: DEFAULT_ROW_WIDTH_BITS,
             bit_size: DEFAULT_BIT_SIZE,
+            target_bit_size: DEFAULT_BIT_SIZE,
             jump_bit_input: String::new(),
             jump_byte_input: String::new(),
             path_input: String::new(),
@@ -107,44 +124,148 @@ impl Default for BitViewerApp {
     }
 }
 
+impl BitViewerApp {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        Self::configure_theme(&cc.egui_ctx);
+        Self::default()
+    }
+
+    fn configure_theme(context: &Context) {
+        let mut style = (*context.style()).clone();
+        style.spacing.item_spacing = egui::vec2(12.0, 12.0);
+        style.spacing.window_margin = egui::Margin::same(18);
+        style.spacing.menu_margin = egui::Margin::same(14);
+        style.spacing.button_padding = egui::vec2(14.0, 10.0);
+        style.spacing.interact_size = egui::vec2(44.0, 34.0);
+        style.spacing.slider_width = 180.0;
+        style.spacing.text_edit_width = 220.0;
+        style.spacing.default_area_size = egui::vec2(720.0, 480.0);
+
+        style.text_styles = [
+            (
+                egui::TextStyle::Small,
+                FontId::new(11.0, FontFamily::Proportional),
+            ),
+            (
+                egui::TextStyle::Body,
+                FontId::new(14.0, FontFamily::Proportional),
+            ),
+            (
+                egui::TextStyle::Button,
+                FontId::new(14.0, FontFamily::Proportional),
+            ),
+            (
+                egui::TextStyle::Heading,
+                FontId::new(24.0, FontFamily::Proportional),
+            ),
+            (
+                egui::TextStyle::Monospace,
+                FontId::new(13.0, FontFamily::Monospace),
+            ),
+        ]
+        .into();
+
+        let mut visuals = egui::Visuals::dark();
+        visuals.override_text_color = Some(TEXT_PRIMARY);
+        visuals.hyperlink_color = ACCENT_COLOR;
+        visuals.faint_bg_color = SURFACE_ALT_BG;
+        visuals.extreme_bg_color = Color32::from_rgb(14, 19, 30);
+        visuals.code_bg_color = SURFACE_ALT_BG;
+        visuals.panel_fill = APP_BG;
+        visuals.window_fill = SURFACE_BG;
+        visuals.window_stroke = Stroke::new(1.0, BORDER_COLOR);
+        visuals.window_corner_radius = CornerRadius::same(20);
+        visuals.menu_corner_radius = CornerRadius::same(16);
+        visuals.window_shadow = egui::epaint::Shadow {
+            offset: [0, 18],
+            blur: 36,
+            spread: 0,
+            color: Color32::from_black_alpha(96),
+        };
+        visuals.popup_shadow = egui::epaint::Shadow {
+            offset: [0, 14],
+            blur: 28,
+            spread: 0,
+            color: Color32::from_black_alpha(92),
+        };
+        visuals.selection.bg_fill = ACCENT_SOFT;
+        visuals.selection.stroke = Stroke::new(1.0, ACCENT_COLOR);
+        visuals.widgets.noninteractive.bg_fill = SURFACE_BG;
+        visuals.widgets.noninteractive.weak_bg_fill = SURFACE_BG;
+        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER_COLOR);
+        visuals.widgets.noninteractive.corner_radius = CornerRadius::same(16);
+        visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT_MUTED);
+        visuals.widgets.inactive.bg_fill = SURFACE_ALT_BG;
+        visuals.widgets.inactive.weak_bg_fill = SURFACE_ALT_BG;
+        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER_COLOR);
+        visuals.widgets.inactive.corner_radius = CornerRadius::same(14);
+        visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+        visuals.widgets.hovered.bg_fill = Color32::from_rgb(33, 44, 68);
+        visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(33, 44, 68);
+        visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, ACCENT_COLOR);
+        visuals.widgets.hovered.corner_radius = CornerRadius::same(16);
+        visuals.widgets.hovered.fg_stroke = Stroke::new(1.2, TEXT_PRIMARY);
+        visuals.widgets.active.bg_fill = ACCENT_SOFT;
+        visuals.widgets.active.weak_bg_fill = ACCENT_SOFT;
+        visuals.widgets.active.bg_stroke = Stroke::new(1.0, ACCENT_COLOR);
+        visuals.widgets.active.corner_radius = CornerRadius::same(16);
+        visuals.widgets.active.fg_stroke = Stroke::new(1.3, TEXT_PRIMARY);
+        visuals.widgets.open.bg_fill = SURFACE_SUBTLE_BG;
+        visuals.widgets.open.weak_bg_fill = SURFACE_SUBTLE_BG;
+        visuals.widgets.open.bg_stroke = Stroke::new(1.0, ACCENT_SOFT);
+        visuals.widgets.open.corner_radius = CornerRadius::same(16);
+        visuals.widgets.open.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+        visuals.warn_fg_color = Color32::from_rgb(255, 190, 92);
+        visuals.error_fg_color = ERROR_COLOR;
+        visuals.indent_has_left_vline = false;
+
+        style.visuals = visuals;
+        context.set_style(style);
+    }
+}
+
 impl eframe::App for BitViewerApp {
     fn update(&mut self, context: &Context, _frame: &mut eframe::Frame) {
         self.poll_file_dialog();
         self.poll_rebuild();
         self.handle_file_drop(context);
         self.handle_keyboard_shortcuts(context);
+        self.advance_view_settings(context);
 
         if self.file_dialog_pending || self.rebuild_pending {
             context.request_repaint_after(POLL_INTERVAL);
         }
 
-        egui::TopBottomPanel::top("toolbar")
+        egui::SidePanel::left("sidebar")
+            .default_width(SIDEBAR_WIDTH)
+            .min_width(300.0)
+            .resizable(true)
             .frame(
                 egui::Frame::new()
-                    .fill(PANEL_FILL)
-                    .stroke(Stroke::new(1.0, Color32::from_gray(220)))
-                    .inner_margin(12.0),
+                    .fill(SIDEBAR_BG)
+                    .stroke(Stroke::new(1.0, BORDER_COLOR))
+                    .inner_margin(18),
             )
             .show(context, |ui| {
-                self.show_toolbar(ui);
+                self.show_sidebar(ui);
             });
 
         egui::TopBottomPanel::bottom("status_bar")
             .frame(
                 egui::Frame::new()
-                    .fill(PANEL_FILL)
-                    .stroke(Stroke::new(1.0, Color32::from_gray(220)))
-                    .inner_margin(8.0),
+                    .fill(SURFACE_BG)
+                    .stroke(Stroke::new(1.0, BORDER_COLOR))
+                    .inner_margin(12),
             )
             .show(context, |ui| {
                 self.show_status(ui);
             });
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(Color32::from_rgb(252, 252, 254)))
+            .frame(egui::Frame::new().fill(APP_BG).inner_margin(20))
             .show(context, |ui| {
                 if self.document.is_some() {
-                    self.show_viewer(ui);
+                    self.show_main_content(ui);
                 } else {
                     self.show_empty_state(ui);
                 }
@@ -155,97 +276,225 @@ impl eframe::App for BitViewerApp {
 }
 
 impl BitViewerApp {
-    fn show_toolbar(&mut self, ui: &mut Ui) {
-        let mut rebuild_requested = false;
+    fn show_sidebar(&mut self, ui: &mut Ui) {
+        ui.heading(RichText::new("Bit Viewer").color(TEXT_PRIMARY));
+        ui.label(
+            RichText::new("High-speed binary inspection for large local files.").color(TEXT_MUTED),
+        );
+        ui.add_space(8.0);
 
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("Open file").clicked() {
-                self.start_file_dialog();
-            }
+        ScrollArea::vertical()
+            .id_salt("sidebar-scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                self.card_frame(SURFACE_BG).show(ui, |ui| {
+                    self.section_header(
+                        ui,
+                        "Workspace",
+                        "Open a file, inspect shortcuts, or resume from a pasted path.",
+                    );
 
-            if ui.button("Info").clicked() {
-                self.show_shortcuts = true;
-            }
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_sized([120.0, 36.0], egui::Button::new("Open file"))
+                            .clicked()
+                        {
+                            self.start_file_dialog();
+                        }
+                        if ui
+                            .add_sized([84.0, 36.0], egui::Button::new("Info"))
+                            .clicked()
+                        {
+                            self.show_shortcuts = true;
+                        }
+                    });
 
-            if self.file_dialog_pending {
-                ui.label(RichText::new("opening chooser...").small().italics());
-            }
+                    if self.file_dialog_pending {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(RichText::new("Opening chooser...").color(TEXT_MUTED));
+                        });
+                    }
 
-            if self.rebuild_pending {
-                ui.separator();
-                ui.spinner();
-                ui.label(
-                    RichText::new("rebuilding filtered view...")
-                        .small()
-                        .italics(),
+                    if self.rebuild_pending {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(
+                                RichText::new("Rebuilding filtered view...").color(TEXT_MUTED),
+                            );
+                        });
+                    }
+
+                    ui.separator();
+                    ui.label(RichText::new("File path").color(TEXT_MUTED));
+                    let path_response = ui.text_edit_singleline(&mut self.path_input);
+                    if path_response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter))
+                    {
+                        self.open_path_input();
+                    }
+                    if ui
+                        .add_sized([ui.available_width(), 34.0], egui::Button::new("Open path"))
+                        .clicked()
+                    {
+                        self.open_path_input();
+                    }
+                });
+
+                self.card_frame(SURFACE_BG).show(ui, |ui| {
+                    self.section_header(
+                        ui,
+                        "Viewer",
+                        "Tune density, scale, and visibility without changing the grid renderer.",
+                    );
+
+                    egui::Grid::new("viewer-settings-grid")
+                        .num_columns(2)
+                        .spacing(egui::vec2(12.0, 10.0))
+                        .show(ui, |ui| {
+                            ui.label(RichText::new("Row width").color(TEXT_MUTED));
+                            let row_width_response = ui.add(
+                                egui::DragValue::new(&mut self.target_row_width_bits)
+                                    .range(MIN_ROW_WIDTH_BITS..=MAX_ROW_WIDTH_BITS)
+                                    .speed(1.0),
+                            );
+                            if row_width_response.changed() {
+                                self.target_row_width_bits = self
+                                    .target_row_width_bits
+                                    .clamp(MIN_ROW_WIDTH_BITS, MAX_ROW_WIDTH_BITS);
+                                self.row_width_bits = self.target_row_width_bits;
+                                self.bit_texture = None;
+                                self.bit_texture_key = None;
+                            }
+                            ui.end_row();
+
+                            ui.label(RichText::new("Bit size").color(TEXT_MUTED));
+                            let bit_size_response = ui.add(
+                                egui::Slider::new(
+                                    &mut self.target_bit_size,
+                                    MIN_BIT_SIZE..=MAX_BIT_SIZE,
+                                )
+                                .clamping(egui::SliderClamping::Always)
+                                .step_by(1.0),
+                            );
+                            if bit_size_response.changed() {
+                                self.target_bit_size =
+                                    self.target_bit_size.clamp(MIN_BIT_SIZE, MAX_BIT_SIZE);
+                                self.bit_size = self.target_bit_size;
+                            }
+                            ui.end_row();
+                        });
+                    self.target_row_width_bits = self
+                        .target_row_width_bits
+                        .clamp(MIN_ROW_WIDTH_BITS, MAX_ROW_WIDTH_BITS);
+                    self.bit_size = self.bit_size.clamp(MIN_BIT_SIZE, MAX_BIT_SIZE);
+                    self.target_bit_size = self.target_bit_size.clamp(MIN_BIT_SIZE, MAX_BIT_SIZE);
+
+                    if self.row_width_bits != self.target_row_width_bits {
+                        ui.label(
+                            RichText::new(format!(
+                                "Animating width {} -> {}",
+                                self.row_width_bits, self.target_row_width_bits
+                            ))
+                            .small()
+                            .color(TEXT_MUTED),
+                        );
+                    }
+
+                    ui.separator();
+                    ui.checkbox(&mut self.show_text_pane, "Show hex / ASCII pane");
+                });
+
+                self.card_frame(SURFACE_BG).show(ui, |ui| {
+                    self.section_header(
+                        ui,
+                        "Navigation",
+                        "Jump directly to offsets and keep both panes aligned.",
+                    );
+
+                    ui.label(RichText::new("Jump to byte offset").color(TEXT_MUTED));
+                    let byte_response = ui.text_edit_singleline(&mut self.jump_byte_input);
+                    if byte_response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter))
+                    {
+                        self.jump_to_byte();
+                    }
+                    if ui
+                        .add_sized(
+                            [ui.available_width(), 34.0],
+                            egui::Button::new("Jump to byte"),
+                        )
+                        .clicked()
+                    {
+                        self.jump_to_byte();
+                    }
+
+                    ui.separator();
+
+                    ui.label(RichText::new("Jump to bit offset").color(TEXT_MUTED));
+                    let bit_response = ui.text_edit_singleline(&mut self.jump_bit_input);
+                    if bit_response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter))
+                    {
+                        self.jump_to_bit();
+                    }
+                    if ui
+                        .add_sized(
+                            [ui.available_width(), 34.0],
+                            egui::Button::new("Jump to bit"),
+                        )
+                        .clicked()
+                    {
+                        self.jump_to_bit();
+                    }
+                });
+
+                let rebuild_requested = self
+                    .card_frame(SURFACE_BG)
+                    .show(ui, |ui| self.show_filter_editor(ui))
+                    .inner;
+
+                if rebuild_requested {
+                    self.schedule_rebuild();
+                }
+
+                if let Some(error) = &self.last_error {
+                    self.card_frame(Color32::from_rgb(58, 22, 28))
+                        .show(ui, |ui| {
+                            self.section_header(
+                                ui,
+                                "Issue",
+                                "The current action did not complete.",
+                            );
+                            ui.colored_label(ERROR_COLOR, error);
+                        });
+                }
+            });
+    }
+
+    fn show_main_content(&mut self, ui: &mut Ui) {
+        self.card_frame(SURFACE_BG).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                let file_label = self
+                    .document
+                    .as_ref()
+                    .map(|document| document.file_name().to_owned())
+                    .unwrap_or_else(|| "No file open".to_owned());
+                ui.heading(RichText::new(file_label).color(TEXT_PRIMARY));
+                ui.add_space(6.0);
+                self.status_chip(
+                    ui,
+                    if self.rebuild_pending {
+                        "Processing filters"
+                    } else {
+                        "Ready"
+                    },
                 );
-            }
-
-            ui.separator();
-
-            ui.label("Row width");
-            ui.add(
-                egui::DragValue::new(&mut self.row_width_bits)
-                    .range(MIN_ROW_WIDTH_BITS..=MAX_ROW_WIDTH_BITS)
-                    .speed(1.0),
-            );
-            self.row_width_bits = self.row_width_bits.max(MIN_ROW_WIDTH_BITS);
-
-            ui.label("Bit size");
-            ui.add(
-                egui::Slider::new(&mut self.bit_size, MIN_BIT_SIZE..=MAX_BIT_SIZE)
-                    .clamping(egui::SliderClamping::Always)
-                    .step_by(1.0),
-            );
-
-            ui.separator();
-            ui.checkbox(&mut self.show_text_pane, "Show hex/ascii");
+            });
         });
 
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Path");
-            let path_response = ui.text_edit_singleline(&mut self.path_input);
-            if path_response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter)) {
-                self.open_path_input();
-            }
-            if ui.button("Open path").clicked() {
-                self.open_path_input();
-            }
+        ui.add_space(16.0);
 
-            ui.separator();
-
-            ui.label("Jump to byte");
-            let byte_response = ui.text_edit_singleline(&mut self.jump_byte_input);
-            if byte_response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter)) {
-                self.jump_to_byte();
-            }
-            if ui.button("Jump byte").clicked() {
-                self.jump_to_byte();
-            }
-
-            ui.separator();
-
-            ui.label("Jump to bit");
-            let bit_response = ui.text_edit_singleline(&mut self.jump_bit_input);
-            if bit_response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter)) {
-                self.jump_to_bit();
-            }
-            if ui.button("Jump bit").clicked() {
-                self.jump_to_bit();
-            }
-
-            if let Some(error) = &self.last_error {
-                ui.separator();
-                ui.colored_label(Color32::from_rgb(190, 44, 44), error);
-            }
+        self.card_frame(SURFACE_ALT_BG).show(ui, |ui| {
+            self.show_viewer(ui);
         });
-
-        ui.separator();
-        rebuild_requested |= self.show_filter_editor(ui);
-
-        if rebuild_requested {
-            self.schedule_rebuild();
-        }
     }
 
     fn show_filter_editor(&mut self, ui: &mut Ui) -> bool {
@@ -254,95 +503,128 @@ impl BitViewerApp {
         let mut move_down = None;
         let mut delete = None;
 
-        ui.label(RichText::new("Filter pipeline").strong());
-        ui.small("Filters run top to bottom. Group filters require a sync/group step earlier in the stack.");
+        self.section_header(
+            ui,
+            "Filter Pipeline",
+            "Stack filters in order. Group-aware steps only work after a sync or grouping stage.",
+        );
 
         if self.pipeline.is_empty() {
             ui.label(
                 RichText::new("No filters. The whole file is shown as one continuous stream.")
-                    .small(),
+                    .small()
+                    .color(TEXT_MUTED),
             );
         }
 
         for index in 0..self.pipeline.steps.len() {
-            ui.horizontal_wrapped(|ui| {
-                ui.monospace(format!("{:02}.", index + 1));
-                if ui.small_button("Up").clicked() && index > 0 {
-                    move_up = Some(index);
-                }
-                if ui.small_button("Down").clicked() && index + 1 < self.pipeline.steps.len() {
-                    move_down = Some(index);
-                }
-                if ui.small_button("Delete").clicked() {
-                    delete = Some(index);
-                }
+            self.card_frame(SURFACE_ALT_BG).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    self.status_chip(ui, &format!("{:02}", index + 1));
+                    ui.label(RichText::new(self.pipeline.steps[index].label()).strong());
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.small_button("Delete").clicked() {
+                            delete = Some(index);
+                        }
+                        if ui.small_button("Down").clicked()
+                            && index + 1 < self.pipeline.steps.len()
+                        {
+                            move_down = Some(index);
+                        }
+                        if ui.small_button("Up").clicked() && index > 0 {
+                            move_up = Some(index);
+                        }
+                    });
+                });
 
                 let step = &mut self.pipeline.steps[index];
-                ui.label(step.label());
-
                 match step {
                     FilterStep::SyncOnPreamble { bits } => {
-                        ui.label("bits");
+                        ui.label(RichText::new("Preamble bits").color(TEXT_MUTED));
                         if ui.text_edit_singleline(bits).changed() {
                             changed = true;
                         }
                     }
-                    FilterStep::ReverseBitsPerByte | FilterStep::InvertBits => {}
+                    FilterStep::ReverseBitsPerByte | FilterStep::InvertBits => {
+                        ui.label(
+                            RichText::new("This step has no additional parameters.")
+                                .small()
+                                .color(TEXT_MUTED),
+                        );
+                    }
                     FilterStep::XorMask { mask } => {
-                        ui.label("mask");
-                        if ui
-                            .add(
-                                egui::DragValue::new(mask)
-                                    .range(0..=u8::MAX)
-                                    .speed(1.0)
-                                    .prefix("0x"),
-                            )
-                            .changed()
-                        {
-                            changed = true;
-                        }
+                        egui::Grid::new(("xor-grid", index))
+                            .num_columns(2)
+                            .spacing(egui::vec2(12.0, 10.0))
+                            .show(ui, |ui| {
+                                ui.label(RichText::new("Mask").color(TEXT_MUTED));
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(mask)
+                                            .range(0..=u8::MAX)
+                                            .speed(1.0)
+                                            .prefix("0x"),
+                                    )
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
+                                ui.end_row();
+                            });
                     }
                     FilterStep::KeepGroupsLongerThanBytes { min_bytes } => {
-                        ui.label(">");
-                        if ui
-                            .add(
-                                egui::DragValue::new(min_bytes)
-                                    .range(0..=usize::MAX)
-                                    .speed(1.0),
-                            )
-                            .changed()
-                        {
-                            changed = true;
-                        }
-                        ui.label("bytes");
+                        egui::Grid::new(("keep-groups-grid", index))
+                            .num_columns(2)
+                            .spacing(egui::vec2(12.0, 10.0))
+                            .show(ui, |ui| {
+                                ui.label(RichText::new("Minimum bytes").color(TEXT_MUTED));
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(min_bytes)
+                                            .range(0..=usize::MAX)
+                                            .speed(1.0),
+                                    )
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
+                                ui.end_row();
+                            });
                     }
                     FilterStep::SelectBitRangeFromGroup {
                         start_bit,
                         length_bits,
                     } => {
-                        ui.label("start");
-                        if ui
-                            .add(
-                                egui::DragValue::new(start_bit)
-                                    .range(0..=usize::MAX)
-                                    .speed(1.0),
-                            )
-                            .changed()
-                        {
-                            changed = true;
-                        }
-                        ui.label("length");
-                        if ui
-                            .add(
-                                egui::DragValue::new(length_bits)
-                                    .range(0..=usize::MAX)
-                                    .speed(1.0),
-                            )
-                            .changed()
-                        {
-                            changed = true;
-                        }
-                        ui.label("bits");
+                        egui::Grid::new(("select-range-grid", index))
+                            .num_columns(2)
+                            .spacing(egui::vec2(12.0, 10.0))
+                            .show(ui, |ui| {
+                                ui.label(RichText::new("Start bit").color(TEXT_MUTED));
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(start_bit)
+                                            .range(0..=usize::MAX)
+                                            .speed(1.0),
+                                    )
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
+                                ui.end_row();
+
+                                ui.label(RichText::new("Length bits").color(TEXT_MUTED));
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(length_bits)
+                                            .range(0..=usize::MAX)
+                                            .speed(1.0),
+                                    )
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
+                                ui.end_row();
+                            });
                     }
                 }
             });
@@ -361,45 +643,62 @@ impl BitViewerApp {
             changed = true;
         }
 
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("+ Sync").clicked() {
-                self.pipeline.steps.push(FilterStep::SyncOnPreamble {
-                    bits: "1010".to_owned(),
-                });
-                changed = true;
-            }
-            if ui.button("+ Reverse bytes").clicked() {
-                self.pipeline.steps.push(FilterStep::ReverseBitsPerByte);
-                changed = true;
-            }
-            if ui.button("+ Invert").clicked() {
-                self.pipeline.steps.push(FilterStep::InvertBits);
-                changed = true;
-            }
-            if ui.button("+ XOR").clicked() {
-                self.pipeline.steps.push(FilterStep::XorMask { mask: 0xFF });
-                changed = true;
-            }
-            if ui.button("+ Keep > bytes").clicked() {
-                self.pipeline
-                    .steps
-                    .push(FilterStep::KeepGroupsLongerThanBytes { min_bytes: 6 });
-                changed = true;
-            }
-            if ui.button("+ Select bits").clicked() {
-                self.pipeline
-                    .steps
-                    .push(FilterStep::SelectBitRangeFromGroup {
-                        start_bit: 0,
-                        length_bits: 48,
+        ui.separator();
+        ui.label(RichText::new("Add step").color(TEXT_MUTED));
+        egui::Grid::new("filter-add-grid")
+            .num_columns(2)
+            .spacing(egui::vec2(10.0, 10.0))
+            .show(ui, |ui| {
+                if ui.button("Sync on preamble").clicked() {
+                    self.pipeline.steps.push(FilterStep::SyncOnPreamble {
+                        bits: "1010".to_owned(),
                     });
-                changed = true;
-            }
-            if ui.button("Clear pipeline").clicked() {
-                self.pipeline.steps.clear();
-                changed = true;
-            }
-        });
+                    changed = true;
+                }
+                if ui.button("Reverse bytes").clicked() {
+                    self.pipeline.steps.push(FilterStep::ReverseBitsPerByte);
+                    changed = true;
+                }
+                ui.end_row();
+
+                if ui.button("Invert bits").clicked() {
+                    self.pipeline.steps.push(FilterStep::InvertBits);
+                    changed = true;
+                }
+                if ui.button("XOR mask").clicked() {
+                    self.pipeline.steps.push(FilterStep::XorMask { mask: 0xFF });
+                    changed = true;
+                }
+                ui.end_row();
+
+                if ui.button("Keep groups > N bytes").clicked() {
+                    self.pipeline
+                        .steps
+                        .push(FilterStep::KeepGroupsLongerThanBytes { min_bytes: 6 });
+                    changed = true;
+                }
+                if ui.button("Select bit range").clicked() {
+                    self.pipeline
+                        .steps
+                        .push(FilterStep::SelectBitRangeFromGroup {
+                            start_bit: 0,
+                            length_bits: 48,
+                        });
+                    changed = true;
+                }
+                ui.end_row();
+            });
+
+        if ui
+            .add_sized(
+                [ui.available_width(), 34.0],
+                egui::Button::new("Clear pipeline"),
+            )
+            .clicked()
+        {
+            self.pipeline.steps.clear();
+            changed = true;
+        }
 
         changed
     }
@@ -407,68 +706,69 @@ impl BitViewerApp {
     fn show_status(&self, ui: &mut Ui) {
         ui.horizontal_wrapped(|ui| {
             if let Some(document) = &self.document {
-                ui.label(
-                    RichText::new(format!(
-                        "{} | source {} bytes | {} bits",
-                        document.file_name(),
-                        document.len_bytes(),
-                        document.len_bits()
-                    ))
-                    .monospace(),
-                );
+                self.status_chip(ui, document.file_name());
+                self.status_chip(ui, &format!("source {} bytes", document.len_bytes()));
+                self.status_chip(ui, &format!("{} bits", document.len_bits()));
 
                 if let Some(view) = &self.derived_view {
-                    ui.separator();
-                    ui.label(
-                        RichText::new(format!(
-                            "derived {} groups | {} bits | {} bytes rounded",
-                            view.group_count(),
-                            view.total_bits(),
-                            view.total_bytes_rounded_up()
-                        ))
-                        .monospace(),
+                    self.status_chip(ui, &format!("{} groups", view.group_count()));
+                    self.status_chip(ui, &format!("derived {} bits", view.total_bits()));
+                    self.status_chip(
+                        ui,
+                        &format!("{} bytes rounded", view.total_bytes_rounded_up()),
                     );
                 }
 
                 if self.rebuild_pending {
-                    ui.separator();
                     ui.spinner();
-                    ui.label(RichText::new("processing filters").monospace());
+                    ui.label(RichText::new("processing filters").color(TEXT_MUTED));
                 }
 
                 if !self.pipeline.is_empty() {
-                    ui.separator();
-                    ui.label(
-                        RichText::new(format!("{} filter(s) active", self.pipeline.steps.len()))
-                            .monospace(),
-                    );
+                    self.status_chip(ui, &format!("{} filter(s)", self.pipeline.steps.len()));
                 }
 
-                ui.separator();
                 ui.label(
                     RichText::new(document.path().display().to_string())
                         .monospace()
-                        .small(),
+                        .small()
+                        .color(TEXT_MUTED),
                 );
             } else {
-                ui.label("Open a file to start exploring bits, hex, and ASCII.");
+                ui.label(
+                    RichText::new("Open a file to start exploring bits, hex, and ASCII.")
+                        .color(TEXT_MUTED),
+                );
             }
         });
     }
 
     fn show_empty_state(&mut self, ui: &mut Ui) {
-        ui.with_layout(Layout::top_down_justified(Align::Center), |ui| {
-            ui.add_space(96.0);
-            ui.heading("Bit Viewer Desktop");
-            ui.label("Native Rust viewer for large binary files.");
-            ui.add_space(12.0);
-            if ui.button("Open file").clicked() {
-                self.start_file_dialog();
-            }
-            ui.add_space(12.0);
-            ui.label(
-                "If the native file chooser stalls, paste a full path above or drag a file into the window.",
-            );
+        ui.centered_and_justified(|ui| {
+            self.card_frame(SURFACE_BG).show(ui, |ui| {
+                ui.set_max_width(520.0);
+                ui.vertical_centered(|ui| {
+                    ui.heading(RichText::new("Bit Viewer Desktop").color(TEXT_PRIMARY));
+                    ui.label(
+                        RichText::new("A native Rust binary explorer with a faster rendering path for large files.")
+                            .color(TEXT_MUTED),
+                    );
+                    ui.add_space(8.0);
+                    if ui
+                        .add_sized([160.0, 38.0], egui::Button::new("Open file"))
+                        .clicked()
+                    {
+                        self.start_file_dialog();
+                    }
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(
+                            "If the native chooser stalls, paste a full path in the left panel or drag a file into the window.",
+                        )
+                        .color(TEXT_MUTED),
+                    );
+                });
+            });
         });
     }
 
@@ -477,20 +777,84 @@ impl BitViewerApp {
             return;
         }
 
+        let mut show_shortcuts = self.show_shortcuts;
         egui::Window::new("Shortcuts")
-            .open(&mut self.show_shortcuts)
+            .open(&mut show_shortcuts)
             .resizable(false)
             .collapsible(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(SURFACE_BG)
+                    .stroke(Stroke::new(1.0, BORDER_COLOR))
+                    .corner_radius(CornerRadius::same(20))
+                    .inner_margin(18),
+            )
             .show(context, |ui| {
-                ui.label(RichText::new("Viewer").strong());
-                ui.monospace("[ / ]     Decrease / increase row width");
-                ui.monospace("- / =     Decrease / increase bit size");
-                ui.monospace("I         Toggle this shortcuts window");
+                self.section_header(
+                    ui,
+                    "Shortcuts",
+                    "Fast controls for density, size, and viewport movement.",
+                );
+                egui::Grid::new("shortcuts-grid")
+                    .num_columns(2)
+                    .spacing(egui::vec2(16.0, 10.0))
+                    .show(ui, |ui| {
+                        ui.monospace("[ / ]");
+                        ui.label(RichText::new("Decrease / increase row width").color(TEXT_MUTED));
+                        ui.end_row();
+
+                        ui.monospace("- / =");
+                        ui.label(RichText::new("Decrease / increase bit size").color(TEXT_MUTED));
+                        ui.end_row();
+
+                        ui.monospace("I");
+                        ui.label(RichText::new("Toggle this shortcuts window").color(TEXT_MUTED));
+                        ui.end_row();
+                    });
                 ui.separator();
                 ui.label(RichText::new("Navigation").strong());
-                ui.monospace("Arrow Up / Down   Scroll by 1 row");
-                ui.monospace("Page Up / Down    Scroll by 20 rows");
-                ui.monospace("Home / End        Jump to start / end");
+                egui::Grid::new("navigation-shortcuts-grid")
+                    .num_columns(2)
+                    .spacing(egui::vec2(16.0, 10.0))
+                    .show(ui, |ui| {
+                        ui.monospace("Arrow Up / Down");
+                        ui.label(RichText::new("Scroll by 1 row").color(TEXT_MUTED));
+                        ui.end_row();
+
+                        ui.monospace("Page Up / Down");
+                        ui.label(RichText::new("Scroll by 20 rows").color(TEXT_MUTED));
+                        ui.end_row();
+
+                        ui.monospace("Home / End");
+                        ui.label(RichText::new("Jump to start / end").color(TEXT_MUTED));
+                        ui.end_row();
+                    });
+            });
+        self.show_shortcuts = show_shortcuts;
+    }
+
+    fn card_frame(&self, fill: Color32) -> egui::Frame {
+        egui::Frame::new()
+            .fill(fill)
+            .stroke(Stroke::new(1.0, BORDER_COLOR))
+            .corner_radius(CornerRadius::same(18))
+            .inner_margin(18)
+    }
+
+    fn section_header(&self, ui: &mut Ui, title: &str, subtitle: &str) {
+        ui.label(RichText::new(title).strong().color(TEXT_PRIMARY));
+        ui.label(RichText::new(subtitle).small().color(TEXT_MUTED));
+        ui.add_space(4.0);
+    }
+
+    fn status_chip(&self, ui: &mut Ui, label: &str) {
+        egui::Frame::new()
+            .fill(SURFACE_SUBTLE_BG)
+            .stroke(Stroke::new(1.0, ACCENT_SOFT))
+            .corner_radius(CornerRadius::same(255))
+            .inner_margin(egui::Margin::symmetric(10, 6))
+            .show(ui, |ui| {
+                ui.label(RichText::new(label).small().color(TEXT_PRIMARY));
             });
     }
 
@@ -499,9 +863,9 @@ impl BitViewerApp {
             ui.centered_and_justified(|ui| {
                 if self.rebuild_pending {
                     ui.spinner();
-                    ui.label("Building filtered view...");
+                    ui.label(RichText::new("Building filtered view...").color(TEXT_MUTED));
                 } else {
-                    ui.label("No derived view is available.");
+                    ui.label(RichText::new("No derived view is available.").color(TEXT_MUTED));
                 }
             });
             return;
@@ -517,7 +881,10 @@ impl BitViewerApp {
         let total_rows = layout.total_rows();
         if total_rows == 0 {
             ui.centered_and_justified(|ui| {
-                ui.label("No rows remain after applying the current filters.");
+                ui.label(
+                    RichText::new("No rows remain after applying the current filters.")
+                        .color(TEXT_MUTED),
+                );
             });
             return;
         }
@@ -528,28 +895,30 @@ impl BitViewerApp {
         let text_row_height = TEXT_ROW_HEIGHT;
         let bytes_per_row = self.row_width_bits.div_ceil(8);
         let hex_width = HEX_COLUMN_MIN_WIDTH.max(bytes_per_row as f32 * 21.0);
-        let ascii_width = ASCII_COLUMN_MIN_WIDTH.max(bytes_per_row as f32 * 10.0);
         let bit_panel_width = self.row_width_bits as f32 * self.bit_size;
         let bit_content_height = total_rows as f32 * bit_row_height;
         let available_height = ui.available_height();
         let mut observed_bit_scroll_row = self.current_bit_scroll_row;
         let mut observed_text_scroll_row = self.current_text_scroll_row;
+        if self.show_text_pane {
+            let mut hex_observed_row = observed_text_scroll_row;
+            let mut ascii_observed_row = observed_text_scroll_row;
 
-        ui.horizontal(|ui| {
-            let bit_area_width = if self.show_text_pane {
-                ui.available_width() - TEXT_PANEL_WIDTH
-            } else {
-                ui.available_width()
-            };
-            ui.allocate_ui_with_layout(
-                Vec2::new(bit_area_width, available_height),
-                Layout::top_down(Align::Min),
-                |ui| {
+            egui::SidePanel::left("bit-grid-pane")
+                .resizable(true)
+                .show_separator_line(true)
+                .default_width(bit_panel_width.max(BIT_PANEL_MIN_WIDTH))
+                .min_width(BIT_PANEL_MIN_WIDTH)
+                .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(0, 0)))
+                .show_inside(ui, |ui| {
+                    ui.set_min_height(available_height);
                     ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
 
                     let mut scroll_area = ScrollArea::both()
                         .id_salt("native-bit-scroll")
                         .auto_shrink([false, false])
+                        .max_height(available_height)
+                        .min_scrolled_height(available_height)
                         .wheel_scroll_multiplier(SCROLL_MULTIPLIER);
 
                     if let Some(target_row) = pending_bit_scroll_to_row {
@@ -612,56 +981,177 @@ impl BitViewerApp {
                     });
                     observed_bit_scroll_row =
                         (output.state.offset.y / bit_row_height).floor().max(0.0) as usize;
-                },
-            );
+                });
 
-            if self.show_text_pane {
-                ui.separator();
+            egui::SidePanel::left("hex-text-pane")
+                .resizable(true)
+                .show_separator_line(true)
+                .default_width(hex_width.max(HEX_PANEL_DEFAULT_WIDTH))
+                .min_width(HEX_COLUMN_MIN_WIDTH)
+                .frame(
+                    egui::Frame::new()
+                        .fill(SURFACE_ALT_BG)
+                        .inner_margin(egui::Margin::symmetric(12, 8)),
+                )
+                .show_inside(ui, |ui| {
+                    ui.set_min_height(available_height);
+                    let pane_width = ui.available_width().max(HEX_COLUMN_MIN_WIDTH);
+                    let mut scroll_area = ScrollArea::both()
+                        .id_salt("native-hex-scroll")
+                        .auto_shrink([false, false])
+                        .max_height(available_height)
+                        .min_scrolled_height(available_height)
+                        .wheel_scroll_multiplier(SCROLL_MULTIPLIER);
 
-                ui.allocate_ui_with_layout(
-                    Vec2::new(TEXT_PANEL_WIDTH, available_height),
-                    Layout::top_down(Align::Min),
-                    |ui| {
-                        let mut scroll_area = ScrollArea::both()
-                            .id_salt("native-text-scroll")
-                            .auto_shrink([false, false])
-                            .wheel_scroll_multiplier(SCROLL_MULTIPLIER);
+                    if let Some(target_row) = pending_text_scroll_to_row {
+                        scroll_area =
+                            scroll_area.vertical_scroll_offset(target_row as f32 * text_row_height);
+                    }
 
-                        if let Some(target_row) = pending_text_scroll_to_row {
-                            scroll_area = scroll_area
-                                .vertical_scroll_offset(target_row as f32 * text_row_height);
+                    let output =
+                        scroll_area.show_rows(ui, text_row_height, total_rows, |ui, row_range| {
+                            let start = row_range.start.saturating_sub(TEXT_OVERSCAN_ROWS);
+                            let end = (row_range.end + TEXT_OVERSCAN_ROWS).min(total_rows);
+
+                            let Some(view) = self.derived_view.as_ref() else {
+                                return;
+                            };
+                            for row_index in start..end {
+                                let row = build_row(view, &layout, row_index);
+                                paint_single_text_row(
+                                    ui,
+                                    &row.hex,
+                                    text_row_height,
+                                    pane_width.max(hex_width),
+                                    TEXT_PRIMARY,
+                                );
+                            }
+                        });
+                    hex_observed_row =
+                        (output.state.offset.y / text_row_height).floor().max(0.0) as usize;
+                });
+
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::new()
+                        .fill(SURFACE_ALT_BG)
+                        .inner_margin(egui::Margin::symmetric(20, 8)),
+                )
+                .show_inside(ui, |ui| {
+                    ui.set_min_height(available_height);
+                    let pane_width = ui.available_width().max(ASCII_COLUMN_MIN_WIDTH);
+                    let mut scroll_area = ScrollArea::both()
+                        .id_salt("native-ascii-scroll")
+                        .auto_shrink([false, false])
+                        .max_height(available_height)
+                        .min_scrolled_height(available_height)
+                        .wheel_scroll_multiplier(SCROLL_MULTIPLIER);
+
+                    if let Some(target_row) = pending_text_scroll_to_row {
+                        scroll_area =
+                            scroll_area.vertical_scroll_offset(target_row as f32 * text_row_height);
+                    }
+
+                    let output =
+                        scroll_area.show_rows(ui, text_row_height, total_rows, |ui, row_range| {
+                            let start = row_range.start.saturating_sub(TEXT_OVERSCAN_ROWS);
+                            let end = (row_range.end + TEXT_OVERSCAN_ROWS).min(total_rows);
+
+                            let Some(view) = self.derived_view.as_ref() else {
+                                return;
+                            };
+                            for row_index in start..end {
+                                let row = build_row(view, &layout, row_index);
+                                paint_single_text_row(
+                                    ui,
+                                    &row.ascii,
+                                    text_row_height,
+                                    pane_width,
+                                    TEXT_MUTED,
+                                );
+                            }
+                        });
+                    ascii_observed_row =
+                        (output.state.offset.y / text_row_height).floor().max(0.0) as usize;
+                });
+
+            observed_text_scroll_row = hex_observed_row.max(ascii_observed_row);
+        } else {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(0, 0)))
+                .show_inside(ui, |ui| {
+                    ui.set_min_height(available_height);
+                    ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+
+                    let mut scroll_area = ScrollArea::both()
+                        .id_salt("native-bit-scroll")
+                        .auto_shrink([false, false])
+                        .max_height(available_height)
+                        .min_scrolled_height(available_height)
+                        .wheel_scroll_multiplier(SCROLL_MULTIPLIER);
+
+                    if let Some(target_row) = pending_bit_scroll_to_row {
+                        scroll_area =
+                            scroll_area.vertical_scroll_offset(target_row as f32 * bit_row_height);
+                    }
+
+                    let output = scroll_area.show_viewport(ui, |ui, viewport| {
+                        ui.set_min_size(Vec2::new(bit_panel_width, bit_content_height));
+
+                        let viewport_start_row =
+                            (viewport.min.y / bit_row_height).floor().max(0.0) as usize;
+                        let viewport_end_row = (viewport.max.y / bit_row_height).ceil() as usize;
+                        let viewport_start_col =
+                            (viewport.min.x / self.bit_size).floor().max(0.0) as usize;
+                        let viewport_end_col =
+                            (viewport.max.x / self.bit_size).ceil().max(0.0) as usize;
+                        let cache_start_row = viewport_start_row.saturating_sub(BIT_OVERSCAN_ROWS);
+                        let cache_end_row = (viewport_end_row + BIT_OVERSCAN_ROWS).min(total_rows);
+                        let cache_row_count = cache_end_row.saturating_sub(cache_start_row);
+                        let cache_start_col = viewport_start_col.saturating_sub(BIT_OVERSCAN_COLS);
+                        let cache_end_col =
+                            (viewport_end_col + BIT_OVERSCAN_COLS).min(self.row_width_bits);
+                        let cache_col_count = cache_end_col.saturating_sub(cache_start_col);
+
+                        if let Some(texture_id) = self.ensure_bit_texture(
+                            ui.ctx(),
+                            &layout,
+                            cache_start_row,
+                            cache_row_count,
+                            cache_start_col,
+                            cache_col_count,
+                        ) {
+                            let cache_rect = Rect::from_min_size(
+                                egui::pos2(
+                                    ui.max_rect().left() + cache_start_col as f32 * self.bit_size,
+                                    ui.max_rect().top() + cache_start_row as f32 * bit_row_height,
+                                ),
+                                Vec2::new(
+                                    cache_col_count as f32 * self.bit_size,
+                                    cache_row_count as f32 * bit_row_height,
+                                ),
+                            );
+                            ui.painter().image(
+                                texture_id,
+                                cache_rect,
+                                Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                Color32::WHITE,
+                            );
+                            paint_bit_grid_lines(
+                                ui,
+                                cache_rect,
+                                cache_start_col,
+                                cache_col_count,
+                                cache_row_count,
+                                self.bit_size,
+                                bit_row_height,
+                            );
                         }
-
-                        let output = scroll_area.show_rows(
-                            ui,
-                            text_row_height,
-                            total_rows,
-                            |ui, row_range| {
-                                let start = row_range.start.saturating_sub(TEXT_OVERSCAN_ROWS);
-                                let end = (row_range.end + TEXT_OVERSCAN_ROWS).min(total_rows);
-
-                                let Some(view) = self.derived_view.as_ref() else {
-                                    return;
-                                };
-                                for row_index in start..end {
-                                    let row = build_row(view, &layout, row_index);
-                                    paint_text_row(
-                                        ui,
-                                        &row.hex,
-                                        &row.ascii,
-                                        text_row_height,
-                                        hex_width,
-                                        ascii_width,
-                                    );
-                                }
-                            },
-                        );
-                        observed_text_scroll_row =
-                            (output.state.offset.y / text_row_height).floor().max(0.0) as usize;
-                    },
-                );
-            }
-        });
+                    });
+                    observed_bit_scroll_row =
+                        (output.state.offset.y / bit_row_height).floor().max(0.0) as usize;
+                });
+        }
 
         self.current_bit_scroll_row = observed_bit_scroll_row.min(total_rows.saturating_sub(1));
         self.current_text_scroll_row = observed_text_scroll_row.min(total_rows.saturating_sub(1));
@@ -982,23 +1472,56 @@ impl BitViewerApp {
         self.pending_text_scroll_to_row = Some(next_row);
     }
 
+    fn advance_view_settings(&mut self, context: &Context) {
+        let mut needs_repaint = false;
+
+        if self.row_width_bits < self.target_row_width_bits {
+            self.row_width_bits =
+                (self.row_width_bits + ROW_WIDTH_STEP_BITS).min(self.target_row_width_bits);
+            self.bit_texture = None;
+            self.bit_texture_key = None;
+            needs_repaint = true;
+        } else if self.row_width_bits > self.target_row_width_bits {
+            self.row_width_bits = self
+                .row_width_bits
+                .saturating_sub(ROW_WIDTH_STEP_BITS)
+                .max(self.target_row_width_bits);
+            self.bit_texture = None;
+            self.bit_texture_key = None;
+            needs_repaint = true;
+        }
+
+        if self.bit_size < self.target_bit_size {
+            self.bit_size = (self.bit_size + BIT_SIZE_STEP).min(self.target_bit_size);
+            needs_repaint = true;
+        } else if self.bit_size > self.target_bit_size {
+            self.bit_size = (self.bit_size - BIT_SIZE_STEP).max(self.target_bit_size);
+            needs_repaint = true;
+        }
+
+        if needs_repaint {
+            context.request_repaint();
+        }
+    }
+
     fn increase_row_width(&mut self) {
-        self.row_width_bits = (self.row_width_bits + ROW_WIDTH_STEP_BITS).min(MAX_ROW_WIDTH_BITS);
+        self.target_row_width_bits =
+            (self.target_row_width_bits + ROW_WIDTH_STEP_BITS).min(MAX_ROW_WIDTH_BITS);
     }
 
     fn decrease_row_width(&mut self) {
-        self.row_width_bits = self
-            .row_width_bits
+        self.target_row_width_bits = self
+            .target_row_width_bits
             .saturating_sub(ROW_WIDTH_STEP_BITS)
             .max(MIN_ROW_WIDTH_BITS);
     }
 
     fn increase_bit_size(&mut self) {
-        self.bit_size = (self.bit_size + BIT_SIZE_STEP).min(MAX_BIT_SIZE);
+        self.target_bit_size = (self.target_bit_size + BIT_SIZE_STEP).min(MAX_BIT_SIZE);
     }
 
     fn decrease_bit_size(&mut self) {
-        self.bit_size = (self.bit_size - BIT_SIZE_STEP).max(MIN_BIT_SIZE);
+        self.target_bit_size = (self.target_bit_size - BIT_SIZE_STEP).max(MIN_BIT_SIZE);
     }
 }
 
@@ -1035,33 +1558,13 @@ fn paint_bit_grid_lines(
     }
 }
 
-fn paint_text_row(
-    ui: &mut Ui,
-    hex: &str,
-    ascii: &str,
-    row_height: f32,
-    hex_width: f32,
-    ascii_width: f32,
-) {
-    ui.horizontal(|ui| {
-        let (hex_rect, _) =
-            ui.allocate_exact_size(Vec2::new(hex_width, row_height), egui::Sense::hover());
-        ui.painter().text(
-            hex_rect.left_center(),
-            egui::Align2::LEFT_CENTER,
-            hex,
-            FontId::new(13.0, FontFamily::Monospace),
-            Color32::from_gray(40),
-        );
-
-        let (ascii_rect, _) =
-            ui.allocate_exact_size(Vec2::new(ascii_width, row_height), egui::Sense::hover());
-        ui.painter().text(
-            ascii_rect.left_center(),
-            egui::Align2::LEFT_CENTER,
-            ascii,
-            FontId::new(13.0, FontFamily::Monospace),
-            Color32::from_gray(64),
-        );
-    });
+fn paint_single_text_row(ui: &mut Ui, text: &str, row_height: f32, width: f32, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, row_height), egui::Sense::hover());
+    ui.painter().text(
+        egui::pos2(rect.left() + TEXT_CELL_PADDING_X, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        text,
+        FontId::new(13.0, FontFamily::Monospace),
+        color,
+    );
 }
