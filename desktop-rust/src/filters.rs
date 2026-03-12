@@ -19,6 +19,7 @@ pub enum FilterStep {
     XorMask {
         mask: u8,
     },
+    Flatten,
     KeepGroupsLongerThanBytes {
         min_bytes: usize,
     },
@@ -35,6 +36,7 @@ impl FilterStep {
             Self::ReverseBitsPerByte => "Reverse bits in each byte",
             Self::InvertBits => "Invert bits",
             Self::XorMask { .. } => "XOR byte mask",
+            Self::Flatten => "Flatten groups",
             Self::KeepGroupsLongerThanBytes { .. } => "Keep groups longer than bytes",
             Self::SelectBitRangeFromGroup { .. } => "Select bit range from group",
         }
@@ -239,6 +241,7 @@ fn apply_step(state: PipelineState, step: &FilterStep) -> Result<PipelineState, 
         FilterStep::ReverseBitsPerByte => Ok(state.map_bytes(u8::reverse_bits)),
         FilterStep::InvertBits => Ok(state.map_bytes(|byte| !byte)),
         FilterStep::XorMask { mask } => Ok(state.map_bytes(|byte| byte ^ mask)),
+        FilterStep::Flatten => Ok(PipelineState::Grouped(vec![state.into_flat()])),
         FilterStep::SyncOnPreamble { bits } => {
             let pattern = parse_preamble_bits(bits)?;
             let buffer = state.into_flat();
@@ -394,6 +397,36 @@ mod tests {
 
         let view = build_derived_view(&bytes, &pipeline).expect("pipeline should succeed");
         assert_eq!(group_bits(&view), vec![vec![1, 0, 0, 0], vec![1, 1, 1, 1]]);
+    }
+
+    #[test]
+    fn flatten_concatenates_all_groups_into_one_group() {
+        let bytes = [0b1010_0001, 0b1010_1111];
+        let pipeline = FilterPipeline {
+            steps: vec![
+                FilterStep::SyncOnPreamble {
+                    bits: "1010".to_owned(),
+                },
+                FilterStep::Flatten,
+            ],
+        };
+
+        let view = build_derived_view(&bytes, &pipeline).expect("pipeline should succeed");
+        assert_eq!(
+            group_bits(&view),
+            vec![vec![1, 0, 1, 0, 0, 0, 0, 1, 1, 0, 1, 0, 1, 1, 1, 1]]
+        );
+    }
+
+    #[test]
+    fn flatten_keeps_flat_input_as_single_group() {
+        let bytes = [0b1111_0000];
+        let pipeline = FilterPipeline {
+            steps: vec![FilterStep::Flatten],
+        };
+
+        let view = build_derived_view(&bytes, &pipeline).expect("pipeline should succeed");
+        assert_eq!(group_bits(&view), vec![vec![1, 1, 1, 1, 0, 0, 0, 0]]);
     }
 
     #[test]

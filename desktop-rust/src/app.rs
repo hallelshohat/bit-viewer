@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Duration;
@@ -11,7 +12,10 @@ use rfd::FileDialog;
 
 use crate::document::BinaryDocument;
 use crate::filters::{DerivedView, FilterPipeline, FilterStep, build_derived_view};
-use crate::viewer::{bit_offset_to_row, build_bit_window, build_row, build_row_layout};
+use crate::viewer::{
+    BIT_VALUE_NO_DATA, RowData, RowLayout, bit_offset_to_row, build_bit_window, build_row,
+    build_row_layout,
+};
 
 const DEFAULT_ROW_WIDTH_BITS: usize = 128;
 const MIN_ROW_WIDTH_BITS: usize = 8;
@@ -24,6 +28,8 @@ const BIT_SIZE_STEP: f32 = 1.0;
 const TEXT_ROW_HEIGHT: f32 = 20.0;
 const BIT_OVERSCAN_ROWS: usize = 24;
 const BIT_OVERSCAN_COLS: usize = 32;
+const RESIZE_BIT_OVERSCAN_ROWS: usize = 8;
+const RESIZE_BIT_OVERSCAN_COLS: usize = 8;
 const TEXT_OVERSCAN_ROWS: usize = 8;
 const SCROLL_MULTIPLIER: Vec2 = Vec2::new(1.5, 2.5);
 const BIT_ONE_COLOR: Color32 = Color32::from_rgb(32, 96, 246);
@@ -64,6 +70,30 @@ struct BitTextureKey {
     col_count: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RowLayoutKey {
+    view_revision: u64,
+    row_width_bits: usize,
+}
+
+struct CachedRowLayout {
+    key: RowLayoutKey,
+    layout: Arc<RowLayout>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TextRowCacheKey {
+    view_revision: u64,
+    row_width_bits: usize,
+    start_row: usize,
+    row_count: usize,
+}
+
+struct CachedTextRows {
+    key: TextRowCacheKey,
+    rows: Vec<RowData>,
+}
+
 pub struct BitViewerApp {
     document: Option<BinaryDocument>,
     derived_view: Option<DerivedView>,
@@ -71,6 +101,8 @@ pub struct BitViewerApp {
     show_text_pane: bool,
     bit_texture: Option<TextureHandle>,
     bit_texture_key: Option<BitTextureKey>,
+    row_layout_cache: Option<CachedRowLayout>,
+    text_row_cache: Option<CachedTextRows>,
     derived_view_revision: u64,
     row_width_bits: usize,
     target_row_width_bits: usize,
@@ -101,6 +133,8 @@ impl Default for BitViewerApp {
             show_text_pane: true,
             bit_texture: None,
             bit_texture_key: None,
+            row_layout_cache: None,
+            text_row_cache: None,
             derived_view_revision: 0,
             row_width_bits: DEFAULT_ROW_WIDTH_BITS,
             target_row_width_bits: DEFAULT_ROW_WIDTH_BITS,
@@ -276,6 +310,60 @@ impl eframe::App for BitViewerApp {
 }
 
 impl BitViewerApp {
+    fn invalidate_render_caches(&mut self) {
+        self.bit_texture = None;
+        self.bit_texture_key = None;
+        self.row_layout_cache = None;
+        self.text_row_cache = None;
+    }
+
+    fn ensure_row_layout(&mut self) -> Option<Arc<RowLayout>> {
+        let view = self.derived_view.as_ref()?;
+        let key = RowLayoutKey {
+            view_revision: self.derived_view_revision,
+            row_width_bits: self.row_width_bits,
+        };
+
+        if self.row_layout_cache.as_ref().map(|cached| cached.key) != Some(key) {
+            self.row_layout_cache = Some(CachedRowLayout {
+                key,
+                layout: Arc::new(build_row_layout(view, self.row_width_bits)),
+            });
+            self.text_row_cache = None;
+        }
+
+        self.row_layout_cache
+            .as_ref()
+            .map(|cached| Arc::clone(&cached.layout))
+    }
+
+    fn text_rows(&mut self, layout: &RowLayout, start_row: usize, row_count: usize) -> &[RowData] {
+        let key = TextRowCacheKey {
+            view_revision: self.derived_view_revision,
+            row_width_bits: self.row_width_bits,
+            start_row,
+            row_count,
+        };
+
+        if self.text_row_cache.as_ref().map(|cached| cached.key) != Some(key) {
+            let rows = self
+                .derived_view
+                .as_ref()
+                .map(|view| {
+                    (0..row_count)
+                        .map(|row_offset| build_row(view, layout, start_row + row_offset))
+                        .collect()
+                })
+                .unwrap_or_default();
+            self.text_row_cache = Some(CachedTextRows { key, rows });
+        }
+
+        self.text_row_cache
+            .as_ref()
+            .map(|cached| cached.rows.as_slice())
+            .unwrap_or(&[])
+    }
+
     fn show_sidebar(&mut self, ui: &mut Ui) {
         ui.heading(RichText::new("Bit Viewer").color(TEXT_PRIMARY));
         ui.label(
@@ -362,8 +450,7 @@ impl BitViewerApp {
                                     .target_row_width_bits
                                     .clamp(MIN_ROW_WIDTH_BITS, MAX_ROW_WIDTH_BITS);
                                 self.row_width_bits = self.target_row_width_bits;
-                                self.bit_texture = None;
-                                self.bit_texture_key = None;
+                                self.invalidate_render_caches();
                             }
                             ui.end_row();
 
@@ -538,17 +625,15 @@ impl BitViewerApp {
 
                 ui.add_space(4.0);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.small_button("Delete").clicked() {
-                            delete = Some(index);
-                        }
-                        if ui.small_button("Down").clicked()
-                            && index + 1 < self.pipeline.steps.len()
-                        {
-                            move_down = Some(index);
-                        }
-                        if ui.small_button("Up").clicked() && index > 0 {
-                            move_up = Some(index);
-                        }
+                    if ui.small_button("Delete").clicked() {
+                        delete = Some(index);
+                    }
+                    if ui.small_button("Down").clicked() && index + 1 < self.pipeline.steps.len() {
+                        move_down = Some(index);
+                    }
+                    if ui.small_button("Up").clicked() && index > 0 {
+                        move_up = Some(index);
+                    }
                 });
 
                 ui.add_space(6.0);
@@ -572,7 +657,9 @@ impl BitViewerApp {
                             changed = true;
                         }
                     }
-                    FilterStep::ReverseBitsPerByte | FilterStep::InvertBits => {
+                    FilterStep::ReverseBitsPerByte
+                    | FilterStep::InvertBits
+                    | FilterStep::Flatten => {
                         ui.label(
                             RichText::new("This step has no additional parameters.")
                                 .small()
@@ -692,12 +779,16 @@ impl BitViewerApp {
                     self.pipeline.steps.push(FilterStep::InvertBits);
                     changed = true;
                 }
-                if ui.button("XOR mask").clicked() {
-                    self.pipeline.steps.push(FilterStep::XorMask { mask: 0xFF });
+                if ui.button("Flatten").clicked() {
+                    self.pipeline.steps.push(FilterStep::Flatten);
                     changed = true;
                 }
                 ui.end_row();
 
+                if ui.button("XOR mask").clicked() {
+                    self.pipeline.steps.push(FilterStep::XorMask { mask: 0xFF });
+                    changed = true;
+                }
                 if ui.button("Keep groups > N bytes").clicked() {
                     self.pipeline
                         .steps
@@ -835,9 +926,7 @@ impl BitViewerApp {
                         ui.end_row();
 
                         ui.monospace("h");
-                        ui.label(
-                            RichText::new("Toggle hex / ASCII panes").color(TEXT_MUTED),
-                        );
+                        ui.label(RichText::new("Toggle hex / ASCII panes").color(TEXT_MUTED));
                         ui.end_row();
 
                         ui.monospace("i");
@@ -904,12 +993,8 @@ impl BitViewerApp {
             return;
         }
 
-        let layout = {
-            let view = self
-                .derived_view
-                .as_ref()
-                .expect("derived view should exist after early return");
-            build_row_layout(view, self.row_width_bits)
+        let Some(layout) = self.ensure_row_layout() else {
+            return;
         };
         let total_rows = layout.total_rows();
         if total_rows == 0 {
@@ -933,6 +1018,17 @@ impl BitViewerApp {
         let available_height = ui.available_height();
         let text_scroll_target_row =
             pending_text_scroll_to_row.unwrap_or(self.current_text_scroll_row);
+        let resizing_row_width = self.row_width_bits != self.target_row_width_bits;
+        let bit_overscan_rows = if resizing_row_width {
+            RESIZE_BIT_OVERSCAN_ROWS
+        } else {
+            BIT_OVERSCAN_ROWS
+        };
+        let bit_overscan_cols = if resizing_row_width {
+            RESIZE_BIT_OVERSCAN_COLS
+        } else {
+            BIT_OVERSCAN_COLS
+        };
         let mut observed_bit_scroll_row = self.current_bit_scroll_row;
         let mut observed_text_scroll_row = self.current_text_scroll_row;
         if self.show_text_pane {
@@ -971,17 +1067,17 @@ impl BitViewerApp {
                             (viewport.min.x / self.bit_size).floor().max(0.0) as usize;
                         let viewport_end_col =
                             (viewport.max.x / self.bit_size).ceil().max(0.0) as usize;
-                        let cache_start_row = viewport_start_row.saturating_sub(BIT_OVERSCAN_ROWS);
-                        let cache_end_row = (viewport_end_row + BIT_OVERSCAN_ROWS).min(total_rows);
+                        let cache_start_row = viewport_start_row.saturating_sub(bit_overscan_rows);
+                        let cache_end_row = (viewport_end_row + bit_overscan_rows).min(total_rows);
                         let cache_row_count = cache_end_row.saturating_sub(cache_start_row);
-                        let cache_start_col = viewport_start_col.saturating_sub(BIT_OVERSCAN_COLS);
+                        let cache_start_col = viewport_start_col.saturating_sub(bit_overscan_cols);
                         let cache_end_col =
-                            (viewport_end_col + BIT_OVERSCAN_COLS).min(self.row_width_bits);
+                            (viewport_end_col + bit_overscan_cols).min(self.row_width_bits);
                         let cache_col_count = cache_end_col.saturating_sub(cache_start_col);
 
                         if let Some(texture_id) = self.ensure_bit_texture(
                             ui.ctx(),
-                            &layout,
+                            layout.as_ref(),
                             cache_start_row,
                             cache_row_count,
                             cache_start_col,
@@ -1046,11 +1142,9 @@ impl BitViewerApp {
                             let start = row_range.start.saturating_sub(TEXT_OVERSCAN_ROWS);
                             let end = (row_range.end + TEXT_OVERSCAN_ROWS).min(total_rows);
 
-                            let Some(view) = self.derived_view.as_ref() else {
-                                return;
-                            };
-                            for row_index in start..end {
-                                let row = build_row(view, &layout, row_index);
+                            for row in
+                                self.text_rows(layout.as_ref(), start, end.saturating_sub(start))
+                            {
                                 paint_single_text_row(
                                     ui,
                                     &row.hex,
@@ -1088,11 +1182,9 @@ impl BitViewerApp {
                             let start = row_range.start.saturating_sub(TEXT_OVERSCAN_ROWS);
                             let end = (row_range.end + TEXT_OVERSCAN_ROWS).min(total_rows);
 
-                            let Some(view) = self.derived_view.as_ref() else {
-                                return;
-                            };
-                            for row_index in start..end {
-                                let row = build_row(view, &layout, row_index);
+                            for row in
+                                self.text_rows(layout.as_ref(), start, end.saturating_sub(start))
+                            {
                                 paint_single_text_row(
                                     ui,
                                     &row.ascii,
@@ -1148,17 +1240,17 @@ impl BitViewerApp {
                             (viewport.min.x / self.bit_size).floor().max(0.0) as usize;
                         let viewport_end_col =
                             (viewport.max.x / self.bit_size).ceil().max(0.0) as usize;
-                        let cache_start_row = viewport_start_row.saturating_sub(BIT_OVERSCAN_ROWS);
-                        let cache_end_row = (viewport_end_row + BIT_OVERSCAN_ROWS).min(total_rows);
+                        let cache_start_row = viewport_start_row.saturating_sub(bit_overscan_rows);
+                        let cache_end_row = (viewport_end_row + bit_overscan_rows).min(total_rows);
                         let cache_row_count = cache_end_row.saturating_sub(cache_start_row);
-                        let cache_start_col = viewport_start_col.saturating_sub(BIT_OVERSCAN_COLS);
+                        let cache_start_col = viewport_start_col.saturating_sub(bit_overscan_cols);
                         let cache_end_col =
-                            (viewport_end_col + BIT_OVERSCAN_COLS).min(self.row_width_bits);
+                            (viewport_end_col + bit_overscan_cols).min(self.row_width_bits);
                         let cache_col_count = cache_end_col.saturating_sub(cache_start_col);
 
                         if let Some(texture_id) = self.ensure_bit_texture(
                             ui.ctx(),
-                            &layout,
+                            layout.as_ref(),
                             cache_start_row,
                             cache_row_count,
                             cache_start_col,
@@ -1232,6 +1324,8 @@ impl BitViewerApp {
                 .map(|bit| {
                     if bit == 1 {
                         BIT_ONE_COLOR
+                    } else if bit == BIT_VALUE_NO_DATA {
+                        Color32::TRANSPARENT
                     } else {
                         BIT_ZERO_COLOR
                     }
@@ -1313,14 +1407,12 @@ impl BitViewerApp {
                     Ok(view) => {
                         self.derived_view = Some(view);
                         self.derived_view_revision = self.derived_view_revision.saturating_add(1);
-                        self.bit_texture = None;
-                        self.bit_texture_key = None;
+                        self.invalidate_render_caches();
                         self.last_error = None;
                     }
                     Err(error) => {
                         self.derived_view = None;
-                        self.bit_texture = None;
-                        self.bit_texture_key = None;
+                        self.invalidate_render_caches();
                         self.last_error = Some(error);
                     }
                 }
@@ -1349,8 +1441,7 @@ impl BitViewerApp {
         self.rebuild_rx = Some(receiver);
         self.rebuild_pending = true;
         self.derived_view = None;
-        self.bit_texture = None;
-        self.bit_texture_key = None;
+        self.invalidate_render_caches();
         self.pending_bit_scroll_to_row = Some(0);
         self.pending_text_scroll_to_row = Some(0);
         self.current_bit_scroll_row = 0;
@@ -1422,19 +1513,26 @@ impl BitViewerApp {
     }
 
     fn jump_to_bit_offset(&mut self, bit_offset: usize) {
-        let Some(view) = &self.derived_view else {
+        let Some(total_bits) = self.derived_view.as_ref().map(DerivedView::total_bits) else {
             self.last_error = Some("Wait for the filtered view to finish building.".to_owned());
             return;
         };
 
-        if view.total_bits() == 0 {
+        if total_bits == 0 {
             self.last_error = Some("There are no bits to jump to in the current view.".to_owned());
             return;
         }
 
-        let layout = build_row_layout(view, self.row_width_bits);
-        let clamped = bit_offset.min(view.total_bits().saturating_sub(1));
-        let row = bit_offset_to_row(view, &layout, clamped);
+        let Some(layout) = self.ensure_row_layout() else {
+            self.last_error = Some("Wait for the filtered view to finish building.".to_owned());
+            return;
+        };
+        let Some(view) = self.derived_view.as_ref() else {
+            self.last_error = Some("Wait for the filtered view to finish building.".to_owned());
+            return;
+        };
+        let clamped = bit_offset.min(total_bits.saturating_sub(1));
+        let row = bit_offset_to_row(view, layout.as_ref(), clamped);
         self.pending_bit_scroll_to_row = Some(row);
         self.pending_text_scroll_to_row = Some(row);
         self.last_error = None;
@@ -1472,11 +1570,13 @@ impl BitViewerApp {
     }
 
     fn handle_keyboard_navigation(&mut self, context: &Context) {
-        let Some(view) = &self.derived_view else {
+        if self.derived_view.is_none() {
+            return;
+        }
+
+        let Some(layout) = self.ensure_row_layout() else {
             return;
         };
-
-        let layout = build_row_layout(view, self.row_width_bits);
         let total_rows = layout.total_rows();
         if total_rows == 0 {
             return;
@@ -1525,16 +1625,14 @@ impl BitViewerApp {
         if self.row_width_bits < self.target_row_width_bits {
             self.row_width_bits =
                 (self.row_width_bits + ROW_WIDTH_STEP_BITS).min(self.target_row_width_bits);
-            self.bit_texture = None;
-            self.bit_texture_key = None;
+            self.invalidate_render_caches();
             needs_repaint = true;
         } else if self.row_width_bits > self.target_row_width_bits {
             self.row_width_bits = self
                 .row_width_bits
                 .saturating_sub(ROW_WIDTH_STEP_BITS)
                 .max(self.target_row_width_bits);
-            self.bit_texture = None;
-            self.bit_texture_key = None;
+            self.invalidate_render_caches();
             needs_repaint = true;
         }
 

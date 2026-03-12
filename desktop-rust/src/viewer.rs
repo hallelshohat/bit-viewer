@@ -1,12 +1,15 @@
 use crate::filters::DerivedView;
 
 pub const ASCII_PLACEHOLDER: char = '.';
+pub const BIT_VALUE_NO_DATA: u8 = 2;
 
+#[derive(Clone, Debug)]
 pub struct RowData {
     pub hex: String,
     pub ascii: String,
 }
 
+#[derive(Clone, Debug)]
 pub struct RowLayout {
     pub row_width_bits: usize,
     group_row_offsets: Vec<usize>,
@@ -76,12 +79,7 @@ pub fn build_row(view: &DerivedView, layout: &RowLayout, row_index: usize) -> Ro
         .saturating_sub(start_bit)
         .min(layout.row_width_bits);
 
-    let mut bits = Vec::with_capacity(bits_to_take);
-    for bit_offset in start_bit..start_bit + bits_to_take {
-        bits.push(group.bit(bit_offset).unwrap_or(0));
-    }
-
-    let (hex, ascii) = render_text_columns(&bits);
+    let (hex, ascii) = render_text_columns(group, start_bit, bits_to_take);
     RowData { hex, ascii }
 }
 
@@ -93,7 +91,7 @@ pub fn build_bit_window(
     start_col: usize,
     col_count: usize,
 ) -> Vec<u8> {
-    let mut bitmap = vec![0; row_count.saturating_mul(col_count)];
+    let mut bitmap = vec![BIT_VALUE_NO_DATA; row_count.saturating_mul(col_count)];
 
     if col_count == 0 {
         return bitmap;
@@ -140,20 +138,28 @@ fn locate_group_row(layout: &RowLayout, row_index: usize) -> Option<(usize, usiz
     Some((group_index, row_index.saturating_sub(row_start)))
 }
 
-fn render_text_columns(bits: &[u8]) -> (String, String) {
-    let mut hex = String::new();
-    let mut ascii = String::new();
+fn render_text_columns(
+    group: &crate::filters::DerivedGroup,
+    start_bit: usize,
+    bit_len: usize,
+) -> (String, String) {
+    let byte_count = bit_len.div_ceil(8);
+    let mut hex = String::with_capacity(byte_count.saturating_mul(3).saturating_sub(1));
+    let mut ascii = String::with_capacity(byte_count);
 
-    for chunk in bits.chunks(8) {
+    for byte_index in 0..byte_count {
         let mut byte = 0u8;
-        for (index, bit) in chunk.iter().enumerate() {
-            byte |= (bit & 1) << (7 - index);
+        let chunk_start = start_bit + byte_index.saturating_mul(8);
+        let chunk_len = bit_len.saturating_sub(byte_index.saturating_mul(8)).min(8);
+
+        for bit_index in 0..chunk_len {
+            byte |= (group.bit(chunk_start + bit_index).unwrap_or(0) & 1) << (7 - bit_index);
         }
 
-        if !hex.is_empty() {
+        if byte_index > 0 {
             hex.push(' ');
         }
-        hex.push_str(&format!("{byte:02X}"));
+        push_hex_byte(&mut hex, byte);
 
         let character = if byte.is_ascii_graphic() || byte == b' ' {
             char::from(byte)
@@ -164,4 +170,29 @@ fn render_text_columns(bits: &[u8]) -> (String, String) {
     }
 
     (hex, ascii)
+}
+
+fn push_hex_byte(output: &mut String, byte: u8) {
+    const HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
+
+    output.push(HEX_DIGITS[(byte >> 4) as usize] as char);
+    output.push(HEX_DIGITS[(byte & 0x0F) as usize] as char);
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::filters::build_derived_view;
+
+    use super::{BIT_VALUE_NO_DATA, build_bit_window, build_row_layout};
+
+    #[test]
+    fn bit_window_marks_cells_past_row_data_as_no_data() {
+        let view = build_derived_view(&[0b1010_0000], &Default::default()).unwrap();
+        let layout = build_row_layout(&view, 12);
+
+        let bitmap = build_bit_window(&view, &layout, 0, 1, 0, 12);
+
+        assert_eq!(&bitmap[..8], &[1, 0, 1, 0, 0, 0, 0, 0]);
+        assert_eq!(&bitmap[8..], &[BIT_VALUE_NO_DATA; 4]);
+    }
 }
