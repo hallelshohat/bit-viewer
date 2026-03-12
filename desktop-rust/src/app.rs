@@ -498,6 +498,18 @@ impl BitViewerApp {
     }
 
     fn show_filter_editor(&mut self, ui: &mut Ui) -> bool {
+        let visuals = &mut ui.style_mut().visuals;
+        visuals.override_text_color = Some(TEXT_PRIMARY);
+        visuals.widgets.inactive.bg_fill = SURFACE_SUBTLE_BG;
+        visuals.widgets.inactive.weak_bg_fill = SURFACE_SUBTLE_BG;
+        visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+        visuals.widgets.hovered.bg_fill = Color32::from_rgb(37, 50, 76);
+        visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(37, 50, 76);
+        visuals.widgets.hovered.fg_stroke = Stroke::new(1.1, TEXT_PRIMARY);
+        visuals.widgets.active.bg_fill = Color32::from_rgb(43, 59, 88);
+        visuals.widgets.active.weak_bg_fill = Color32::from_rgb(43, 59, 88);
+        visuals.widgets.active.fg_stroke = Stroke::new(1.2, TEXT_PRIMARY);
+
         let mut changed = false;
         let mut move_up = None;
         let mut move_down = None;
@@ -522,7 +534,10 @@ impl BitViewerApp {
                 ui.horizontal(|ui| {
                     self.status_chip(ui, &format!("{:02}", index + 1));
                     ui.label(RichText::new(self.pipeline.steps[index].label()).strong());
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                });
+
+                ui.add_space(4.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui.small_button("Delete").clicked() {
                             delete = Some(index);
                         }
@@ -534,14 +549,26 @@ impl BitViewerApp {
                         if ui.small_button("Up").clicked() && index > 0 {
                             move_up = Some(index);
                         }
-                    });
                 });
+
+                ui.add_space(6.0);
 
                 let step = &mut self.pipeline.steps[index];
                 match step {
                     FilterStep::SyncOnPreamble { bits } => {
-                        ui.label(RichText::new("Preamble bits").color(TEXT_MUTED));
-                        if ui.text_edit_singleline(bits).changed() {
+                        let response = ui.horizontal(|ui| {
+                            ui.label(RichText::new("Preamble bits").color(TEXT_MUTED));
+                            ui.add_space(6.0);
+                            ui.scope(|ui| {
+                                let visuals = &mut ui.style_mut().visuals;
+                                visuals.override_text_color = Some(Color32::BLACK);
+                                ui.add_sized(
+                                    [ui.available_width(), 28.0],
+                                    egui::TextEdit::singleline(bits),
+                                )
+                            })
+                        });
+                        if response.inner.inner.changed() {
                             changed = true;
                         }
                     }
@@ -807,7 +834,13 @@ impl BitViewerApp {
                         ui.label(RichText::new("Decrease / increase bit size").color(TEXT_MUTED));
                         ui.end_row();
 
-                        ui.monospace("I");
+                        ui.monospace("h");
+                        ui.label(
+                            RichText::new("Toggle hex / ASCII panes").color(TEXT_MUTED),
+                        );
+                        ui.end_row();
+
+                        ui.monospace("i");
                         ui.label(RichText::new("Toggle this shortcuts window").color(TEXT_MUTED));
                         ui.end_row();
                     });
@@ -898,6 +931,8 @@ impl BitViewerApp {
         let bit_panel_width = self.row_width_bits as f32 * self.bit_size;
         let bit_content_height = total_rows as f32 * bit_row_height;
         let available_height = ui.available_height();
+        let text_scroll_target_row =
+            pending_text_scroll_to_row.unwrap_or(self.current_text_scroll_row);
         let mut observed_bit_scroll_row = self.current_bit_scroll_row;
         let mut observed_text_scroll_row = self.current_text_scroll_row;
         if self.show_text_pane {
@@ -1003,10 +1038,8 @@ impl BitViewerApp {
                         .min_scrolled_height(available_height)
                         .wheel_scroll_multiplier(SCROLL_MULTIPLIER);
 
-                    if let Some(target_row) = pending_text_scroll_to_row {
-                        scroll_area =
-                            scroll_area.vertical_scroll_offset(target_row as f32 * text_row_height);
-                    }
+                    scroll_area = scroll_area
+                        .vertical_scroll_offset(text_scroll_target_row as f32 * text_row_height);
 
                     let output =
                         scroll_area.show_rows(ui, text_row_height, total_rows, |ui, row_range| {
@@ -1047,10 +1080,8 @@ impl BitViewerApp {
                         .min_scrolled_height(available_height)
                         .wheel_scroll_multiplier(SCROLL_MULTIPLIER);
 
-                    if let Some(target_row) = pending_text_scroll_to_row {
-                        scroll_area =
-                            scroll_area.vertical_scroll_offset(target_row as f32 * text_row_height);
-                    }
+                    scroll_area = scroll_area
+                        .vertical_scroll_offset(text_scroll_target_row as f32 * text_row_height);
 
                     let output =
                         scroll_area.show_rows(ui, text_row_height, total_rows, |ui, row_range| {
@@ -1075,10 +1106,22 @@ impl BitViewerApp {
                         (output.state.offset.y / text_row_height).floor().max(0.0) as usize;
                 });
 
-            observed_text_scroll_row = hex_observed_row.max(ascii_observed_row);
+            observed_text_scroll_row = if hex_observed_row != text_scroll_target_row {
+                hex_observed_row
+            } else {
+                ascii_observed_row
+            };
+
+            if observed_text_scroll_row != text_scroll_target_row {
+                ui.ctx().request_repaint();
+            }
         } else {
             egui::CentralPanel::default()
-                .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(0, 0)))
+                .frame(
+                    egui::Frame::new()
+                        .fill(SURFACE_ALT_BG)
+                        .inner_margin(egui::Margin::symmetric(0, 0)),
+                )
                 .show_inside(ui, |ui| {
                     ui.set_min_height(available_height);
                     ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
@@ -1403,6 +1446,10 @@ impl BitViewerApp {
         }
 
         context.input(|input| {
+            if input.key_pressed(Key::H) {
+                self.show_text_pane = !self.show_text_pane;
+            }
+
             if input.key_pressed(Key::I) {
                 self.show_shortcuts = !self.show_shortcuts;
             }
