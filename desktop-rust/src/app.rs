@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
@@ -98,6 +99,25 @@ struct CachedTextRows {
     rows: Vec<RowData>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DrawGranularity {
+    Bit,
+    Byte,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DrawStrokeMode {
+    Paint,
+    Erase,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ActiveDrawStroke {
+    mode: DrawStrokeMode,
+    granularity: DrawGranularity,
+    last_index: usize,
+}
+
 pub struct BitViewerApp {
     document: Option<BinaryDocument>,
     derived_view: Option<DerivedView>,
@@ -120,6 +140,8 @@ pub struct BitViewerApp {
     pending_text_scroll_to_row: Option<usize>,
     current_bit_scroll_row: usize,
     current_text_scroll_row: usize,
+    drawn_bit_columns: BTreeSet<usize>,
+    active_draw_stroke: Option<ActiveDrawStroke>,
     file_dialog_rx: Option<Receiver<Option<PathBuf>>>,
     file_dialog_pending: bool,
     rebuild_rx: Option<Receiver<DerivedBuildResult>>,
@@ -153,6 +175,8 @@ impl Default for BitViewerApp {
             pending_text_scroll_to_row: None,
             current_bit_scroll_row: 0,
             current_text_scroll_row: 0,
+            drawn_bit_columns: BTreeSet::new(),
+            active_draw_stroke: None,
             file_dialog_rx: None,
             file_dialog_pending: false,
             rebuild_rx: None,
@@ -273,6 +297,7 @@ impl eframe::App for BitViewerApp {
         self.poll_file_dialog();
         self.poll_rebuild();
         self.handle_file_drop(context);
+        self.finish_active_draw_stroke_on_release(context);
         self.handle_keyboard_shortcuts(context);
         self.advance_view_settings(context);
 
@@ -373,6 +398,256 @@ impl BitViewerApp {
             .as_ref()
             .map(|cached| cached.rows.as_slice())
             .unwrap_or(&[])
+    }
+
+    fn clear_drawn_columns(&mut self) {
+        self.drawn_bit_columns.clear();
+        self.active_draw_stroke = None;
+    }
+
+    fn finish_active_draw_stroke_on_release(&mut self, context: &Context) {
+        if self.active_draw_stroke.is_some() && !context.input(|input| input.pointer.primary_down())
+        {
+            self.active_draw_stroke = None;
+        }
+    }
+
+    fn trim_drawn_columns_to_row_width(&mut self) {
+        self.drawn_bit_columns = self
+            .drawn_bit_columns
+            .iter()
+            .copied()
+            .filter(|bit_col| *bit_col < self.row_width_bits)
+            .collect();
+
+        if let Some(stroke) = self.active_draw_stroke
+            && stroke.last_index >= self.granularity_limit(stroke.granularity)
+        {
+            self.active_draw_stroke = None;
+        }
+    }
+
+    fn highlighted_bit_ranges(&self) -> Vec<(usize, usize)> {
+        let mut ranges = Vec::new();
+        let mut start = None;
+        let mut previous = None;
+
+        for bit_col in self.drawn_bit_columns.iter().copied() {
+            match (start, previous) {
+                (None, _) => {
+                    start = Some(bit_col);
+                    previous = Some(bit_col);
+                }
+                (Some(range_start), Some(last)) if bit_col == last + 1 => {
+                    start = Some(range_start);
+                    previous = Some(bit_col);
+                }
+                (Some(range_start), Some(last)) => {
+                    ranges.push((range_start, last + 1));
+                    start = Some(bit_col);
+                    previous = Some(bit_col);
+                }
+                _ => {}
+            }
+        }
+
+        if let (Some(range_start), Some(last)) = (start, previous) {
+            ranges.push((range_start, last + 1));
+        }
+
+        ranges
+    }
+
+    fn highlighted_byte_ranges(&self) -> Vec<(usize, usize)> {
+        let mut ranges = Vec::new();
+        let mut start = None;
+        let mut previous = None;
+        let mut last_byte = None;
+
+        for bit_col in self.drawn_bit_columns.iter().copied() {
+            let byte_col = bit_col / 8;
+            if last_byte == Some(byte_col) {
+                continue;
+            }
+            last_byte = Some(byte_col);
+
+            match (start, previous) {
+                (None, _) => {
+                    start = Some(byte_col);
+                    previous = Some(byte_col);
+                }
+                (Some(range_start), Some(last)) if byte_col == last + 1 => {
+                    start = Some(range_start);
+                    previous = Some(byte_col);
+                }
+                (Some(range_start), Some(last)) => {
+                    ranges.push((range_start, last + 1));
+                    start = Some(byte_col);
+                    previous = Some(byte_col);
+                }
+                _ => {}
+            }
+        }
+
+        if let (Some(range_start), Some(last)) = (start, previous) {
+            ranges.push((range_start, last + 1));
+        }
+
+        ranges
+    }
+
+    fn is_bit_drawn(&self, bit_col: usize) -> bool {
+        self.drawn_bit_columns.contains(&bit_col)
+    }
+
+    fn is_byte_drawn(&self, byte_col: usize) -> bool {
+        let start_bit = byte_col.saturating_mul(8);
+        let end_bit = ((byte_col + 1).saturating_mul(8)).min(self.row_width_bits);
+        self.drawn_bit_columns
+            .range(start_bit..end_bit)
+            .next()
+            .is_some()
+    }
+
+    fn granularity_limit(&self, granularity: DrawGranularity) -> usize {
+        match granularity {
+            DrawGranularity::Bit => self.row_width_bits,
+            DrawGranularity::Byte => self.row_width_bits.div_ceil(8),
+        }
+    }
+
+    fn apply_draw_segment(
+        &mut self,
+        granularity: DrawGranularity,
+        start_index: usize,
+        end_index: usize,
+        mode: DrawStrokeMode,
+    ) {
+        let (start, end) = if start_index <= end_index {
+            (start_index, end_index)
+        } else {
+            (end_index, start_index)
+        };
+
+        match granularity {
+            DrawGranularity::Bit => {
+                for bit_col in start..=end {
+                    match mode {
+                        DrawStrokeMode::Paint => {
+                            self.drawn_bit_columns.insert(bit_col);
+                        }
+                        DrawStrokeMode::Erase => {
+                            self.drawn_bit_columns.remove(&bit_col);
+                        }
+                    }
+                }
+            }
+            DrawGranularity::Byte => {
+                for byte_col in start..=end {
+                    let start_bit = byte_col.saturating_mul(8);
+                    let end_bit = ((byte_col + 1).saturating_mul(8)).min(self.row_width_bits);
+                    for bit_col in start_bit..end_bit {
+                        match mode {
+                            DrawStrokeMode::Paint => {
+                                self.drawn_bit_columns.insert(bit_col);
+                            }
+                            DrawStrokeMode::Erase => {
+                                self.drawn_bit_columns.remove(&bit_col);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn start_draw_stroke(&mut self, granularity: DrawGranularity, index: usize) {
+        let mode = match granularity {
+            DrawGranularity::Bit => {
+                if self.is_bit_drawn(index) {
+                    DrawStrokeMode::Erase
+                } else {
+                    DrawStrokeMode::Paint
+                }
+            }
+            DrawGranularity::Byte => {
+                if self.is_byte_drawn(index) {
+                    DrawStrokeMode::Erase
+                } else {
+                    DrawStrokeMode::Paint
+                }
+            }
+        };
+
+        self.apply_draw_segment(granularity, index, index, mode);
+        self.active_draw_stroke = Some(ActiveDrawStroke {
+            mode,
+            granularity,
+            last_index: index,
+        });
+    }
+
+    fn update_draw_stroke(&mut self, granularity: DrawGranularity, index: usize) {
+        match self.active_draw_stroke {
+            Some(mut stroke) if stroke.granularity == granularity => {
+                self.apply_draw_segment(granularity, stroke.last_index, index, stroke.mode);
+                stroke.last_index = index;
+                self.active_draw_stroke = Some(stroke);
+            }
+            Some(stroke) => {
+                self.apply_draw_segment(granularity, index, index, stroke.mode);
+                self.active_draw_stroke = Some(ActiveDrawStroke {
+                    mode: stroke.mode,
+                    granularity,
+                    last_index: index,
+                });
+            }
+            None => {
+                self.start_draw_stroke(granularity, index);
+            }
+        }
+    }
+
+    fn handle_draw_input(
+        &mut self,
+        ui: &Ui,
+        rect: Rect,
+        granularity: DrawGranularity,
+        index: Option<usize>,
+    ) {
+        let (pointer_pos, primary_pressed, primary_down) = ui.ctx().input(|input| {
+            (
+                input.pointer.interact_pos(),
+                input.pointer.primary_pressed(),
+                input.pointer.primary_down(),
+            )
+        });
+
+        if !primary_down {
+            return;
+        }
+
+        let Some(pointer_pos) = pointer_pos else {
+            return;
+        };
+        if !rect.contains(pointer_pos) {
+            return;
+        }
+        let Some(index) = index else {
+            return;
+        };
+        if index >= self.granularity_limit(granularity) {
+            return;
+        }
+
+        if primary_pressed {
+            self.start_draw_stroke(granularity, index);
+            ui.ctx().request_repaint();
+            return;
+        }
+
+        self.update_draw_stroke(granularity, index);
+        ui.ctx().request_repaint();
     }
 
     fn show_top_bar(&mut self, ui: &mut Ui) {
@@ -1270,13 +1545,15 @@ impl BitViewerApp {
                 }
 
                 let output = scroll_area.show_viewport(ui, |ui, viewport| {
-                    ui.set_min_size(Vec2::new(
-                        bit_panel_width
-                            .max(BIT_PANEL_MIN_WIDTH)
-                            .min(BIT_PANEL_DEFAULT_MAX_WIDTH)
-                            .max(bit_panel_width),
-                        bit_content_height,
-                    ));
+                    let content_width = bit_panel_width
+                        .max(BIT_PANEL_MIN_WIDTH)
+                        .min(BIT_PANEL_DEFAULT_MAX_WIDTH)
+                        .max(bit_panel_width);
+                    ui.set_min_size(Vec2::new(content_width, bit_content_height));
+                    let content_rect = Rect::from_min_size(
+                        ui.max_rect().min,
+                        Vec2::new(content_width, bit_content_height),
+                    );
 
                     let viewport_start_row =
                         (viewport.min.y / bit_row_height).floor().max(0.0) as usize;
@@ -1292,6 +1569,7 @@ impl BitViewerApp {
                     let cache_end_col =
                         (viewport_end_col + bit_overscan_cols).min(self.row_width_bits);
                     let cache_col_count = cache_end_col.saturating_sub(cache_start_col);
+                    let highlighted_bit_ranges = self.highlighted_bit_ranges();
 
                     if let Some(texture_id) = self.ensure_bit_texture(
                         ui.ctx(),
@@ -1317,6 +1595,13 @@ impl BitViewerApp {
                             Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                             Color32::WHITE,
                         );
+                        paint_column_drag_overlay(
+                            ui,
+                            content_rect,
+                            self.bit_size,
+                            self.row_width_bits,
+                            highlighted_bit_ranges.as_slice(),
+                        );
                         paint_bit_grid_lines(
                             ui,
                             cache_rect,
@@ -1330,6 +1615,18 @@ impl BitViewerApp {
                 });
                 observed_bit_scroll_row =
                     (output.state.offset.y / bit_row_height).floor().max(0.0) as usize;
+                self.handle_draw_input(
+                    ui,
+                    output.inner_rect,
+                    DrawGranularity::Bit,
+                    pointer_bit_col_in_bit_grid(
+                        output.inner_rect,
+                        output.state.offset.x,
+                        self.bit_size,
+                        self.row_width_bits,
+                        ui.ctx().input(|input| input.pointer.interact_pos()),
+                    ),
+                );
                 self.sync_scroll_positions_on_secondary_click(
                     ui,
                     output.inner_rect,
@@ -1393,6 +1690,7 @@ impl BitViewerApp {
                                 .vertical_scroll_offset(
                                     text_scroll_target_row as f32 * text_row_height,
                                 );
+                            let highlighted_byte_ranges = self.highlighted_byte_ranges();
 
                             let output = scroll_area.show_rows(
                                 ui,
@@ -1414,12 +1712,26 @@ impl BitViewerApp {
                                             pane_width.max(hex_width),
                                             TEXT_PRIMARY,
                                             start + row_offset,
+                                            TextPaneKind::Hex,
+                                            highlighted_byte_ranges.as_slice(),
                                         );
                                     }
                                 },
                             );
                             hex_observed_row =
                                 (output.state.offset.y / text_row_height).floor().max(0.0) as usize;
+                            self.handle_draw_input(
+                                ui,
+                                output.inner_rect,
+                                DrawGranularity::Byte,
+                                pointer_byte_col_in_text_pane(
+                                    output.inner_rect,
+                                    output.state.offset.x,
+                                    bytes_per_row,
+                                    TextPaneKind::Hex,
+                                    ui.ctx().input(|input| input.pointer.interact_pos()),
+                                ),
+                            );
                             self.sync_scroll_positions_on_secondary_click(
                                 ui,
                                 output.inner_rect,
@@ -1452,6 +1764,7 @@ impl BitViewerApp {
                                 .vertical_scroll_offset(
                                     text_scroll_target_row as f32 * text_row_height,
                                 );
+                            let highlighted_byte_ranges = self.highlighted_byte_ranges();
 
                             let output = scroll_area.show_rows(
                                 ui,
@@ -1473,12 +1786,26 @@ impl BitViewerApp {
                                             pane_width,
                                             TEXT_PRIMARY,
                                             start + row_offset,
+                                            TextPaneKind::Ascii,
+                                            highlighted_byte_ranges.as_slice(),
                                         );
                                     }
                                 },
                             );
                             ascii_observed_row =
                                 (output.state.offset.y / text_row_height).floor().max(0.0) as usize;
+                            self.handle_draw_input(
+                                ui,
+                                output.inner_rect,
+                                DrawGranularity::Byte,
+                                pointer_byte_col_in_text_pane(
+                                    output.inner_rect,
+                                    output.state.offset.x,
+                                    bytes_per_row,
+                                    TextPaneKind::Ascii,
+                                    ui.ctx().input(|input| input.pointer.interact_pos()),
+                                ),
+                            );
                             self.sync_scroll_positions_on_secondary_click(
                                 ui,
                                 output.inner_rect,
@@ -1646,6 +1973,7 @@ impl BitViewerApp {
         self.rebuild_pending = true;
         self.derived_view = None;
         self.invalidate_render_caches();
+        self.clear_drawn_columns();
         self.pending_bit_scroll_to_row = Some(0);
         self.pending_text_scroll_to_row = Some(0);
         self.current_bit_scroll_row = 0;
@@ -1830,6 +2158,7 @@ impl BitViewerApp {
             self.row_width_bits =
                 (self.row_width_bits + ROW_WIDTH_STEP_BITS).min(self.target_row_width_bits);
             self.invalidate_render_caches();
+            self.trim_drawn_columns_to_row_width();
             needs_repaint = true;
         } else if self.row_width_bits > self.target_row_width_bits {
             self.row_width_bits = self
@@ -1837,6 +2166,7 @@ impl BitViewerApp {
                 .saturating_sub(ROW_WIDTH_STEP_BITS)
                 .max(self.target_row_width_bits);
             self.invalidate_render_caches();
+            self.trim_drawn_columns_to_row_width();
             needs_repaint = true;
         }
 
@@ -1906,6 +2236,7 @@ impl BitViewerApp {
             self.target_row_width_bits = clamped;
             self.row_width_bits = clamped;
             self.invalidate_render_caches();
+            self.trim_drawn_columns_to_row_width();
         }
         self.row_width_input = clamped.to_string();
     }
@@ -1948,6 +2279,79 @@ fn paint_bit_grid_lines(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TextPaneKind {
+    Hex,
+    Ascii,
+}
+
+fn paint_column_drag_overlay(
+    ui: &mut Ui,
+    rect: Rect,
+    bit_size: f32,
+    row_width_bits: usize,
+    highlighted_bit_ranges: &[(usize, usize)],
+) {
+    if row_width_bits == 0 || highlighted_bit_ranges.is_empty() {
+        return;
+    }
+
+    for (start_bit, end_bit) in highlighted_bit_ranges.iter().copied() {
+        let start_bit = start_bit.min(row_width_bits.saturating_sub(1));
+        let end_bit = end_bit.min(row_width_bits);
+        if start_bit >= end_bit {
+            continue;
+        }
+
+        let highlight_rect = Rect::from_min_max(
+            egui::pos2(rect.left() + start_bit as f32 * bit_size, rect.top()),
+            egui::pos2(rect.left() + end_bit as f32 * bit_size, rect.bottom()),
+        );
+        ui.painter().rect_filled(
+            highlight_rect,
+            CornerRadius::ZERO,
+            ACCENT_SOFT.linear_multiply(0.35),
+        );
+    }
+}
+
+fn pointer_bit_col_in_bit_grid(
+    rect: Rect,
+    horizontal_scroll: f32,
+    bit_size: f32,
+    row_width_bits: usize,
+    pointer_pos: Option<egui::Pos2>,
+) -> Option<usize> {
+    if row_width_bits == 0 {
+        return None;
+    }
+
+    let pointer_pos = pointer_pos?;
+    let bit_col = ((((pointer_pos.x - rect.left()) + horizontal_scroll) / bit_size)
+        .floor()
+        .max(0.0) as usize)
+        .min(row_width_bits.saturating_sub(1));
+    Some(bit_col)
+}
+
+fn pointer_byte_col_in_text_pane(
+    rect: Rect,
+    horizontal_scroll: f32,
+    bytes_per_row: usize,
+    pane_kind: TextPaneKind,
+    pointer_pos: Option<egui::Pos2>,
+) -> Option<usize> {
+    if bytes_per_row == 0 {
+        return None;
+    }
+
+    let pointer_pos = pointer_pos?;
+    let cell_width = text_pane_column_step(pane_kind);
+    let local_x =
+        ((pointer_pos.x - rect.left()) + horizontal_scroll - TEXT_CELL_PADDING_X).max(0.0);
+    Some(((local_x / cell_width).floor().max(0.0) as usize).min(bytes_per_row.saturating_sub(1)))
+}
+
 fn paint_single_text_row(
     ui: &mut Ui,
     text: &str,
@@ -1955,6 +2359,8 @@ fn paint_single_text_row(
     width: f32,
     color: Color32,
     row_index: usize,
+    pane_kind: TextPaneKind,
+    highlighted_byte_ranges: &[(usize, usize)],
 ) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, row_height), egui::Sense::hover());
     let row_fill = if row_index % 2 == 0 {
@@ -1963,6 +2369,7 @@ fn paint_single_text_row(
         SURFACE_ALT_BG
     };
     ui.painter().rect_filled(rect, CornerRadius::ZERO, row_fill);
+    paint_text_column_overlay(ui, rect, pane_kind, highlighted_byte_ranges);
     ui.painter().text(
         egui::pos2(rect.left() + TEXT_CELL_PADDING_X, rect.center().y),
         egui::Align2::LEFT_CENTER,
@@ -1970,4 +2377,112 @@ fn paint_single_text_row(
         FontId::new(13.0, FontFamily::Monospace),
         color,
     );
+}
+
+fn paint_text_column_overlay(
+    ui: &mut Ui,
+    rect: Rect,
+    pane_kind: TextPaneKind,
+    highlighted_byte_ranges: &[(usize, usize)],
+) {
+    if highlighted_byte_ranges.is_empty() {
+        return;
+    }
+
+    let x_step = text_pane_column_step(pane_kind);
+    for (start_col, end_col) in highlighted_byte_ranges.iter().copied() {
+        let highlight_rect = Rect::from_min_max(
+            egui::pos2(
+                rect.left() + TEXT_CELL_PADDING_X + start_col as f32 * x_step,
+                rect.top(),
+            ),
+            egui::pos2(
+                rect.left() + TEXT_CELL_PADDING_X + end_col as f32 * x_step,
+                rect.bottom(),
+            ),
+        );
+        ui.painter().rect_filled(
+            highlight_rect,
+            CornerRadius::ZERO,
+            ACCENT_SOFT.linear_multiply(0.45),
+        );
+    }
+}
+
+fn text_pane_column_step(pane_kind: TextPaneKind) -> f32 {
+    match pane_kind {
+        TextPaneKind::Hex => ASCII_COLUMN_CHAR_WIDTH * 3.0,
+        TextPaneKind::Ascii => ASCII_COLUMN_CHAR_WIDTH,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BitViewerApp, DrawGranularity, TextPaneKind, pointer_bit_col_in_bit_grid,
+        pointer_byte_col_in_text_pane,
+    };
+    use eframe::egui::{Rect, pos2};
+
+    #[test]
+    fn byte_draw_segments_toggle_full_bytes() {
+        let mut app = BitViewerApp::default();
+        app.row_width_bits = 16;
+
+        app.apply_draw_segment(DrawGranularity::Byte, 0, 1, super::DrawStrokeMode::Paint);
+
+        assert_eq!(app.highlighted_bit_ranges(), vec![(0, 16)]);
+
+        app.apply_draw_segment(DrawGranularity::Byte, 1, 1, super::DrawStrokeMode::Erase);
+
+        assert_eq!(app.highlighted_bit_ranges(), vec![(0, 8)]);
+    }
+
+    #[test]
+    fn bit_grid_pointer_maps_to_bit_columns() {
+        let rect = Rect::from_min_max(pos2(10.0, 20.0), pos2(110.0, 220.0));
+
+        assert_eq!(
+            pointer_bit_col_in_bit_grid(rect, 0.0, 5.0, 32, Some(pos2(10.0, 40.0))),
+            Some(0)
+        );
+        assert_eq!(
+            pointer_bit_col_in_bit_grid(rect, 20.0, 5.0, 32, Some(pos2(30.0, 40.0))),
+            Some(8)
+        );
+        assert_eq!(
+            pointer_bit_col_in_bit_grid(rect, 500.0, 5.0, 32, Some(pos2(109.0, 40.0))),
+            Some(31)
+        );
+    }
+
+    #[test]
+    fn text_pointer_maps_to_byte_columns() {
+        let rect = Rect::from_min_max(pos2(10.0, 20.0), pos2(210.0, 220.0));
+
+        assert_eq!(
+            pointer_byte_col_in_text_pane(
+                rect,
+                0.0,
+                16,
+                TextPaneKind::Ascii,
+                Some(pos2(19.0, 40.0))
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            pointer_byte_col_in_text_pane(rect, 0.0, 16, TextPaneKind::Hex, Some(pos2(45.0, 40.0))),
+            Some(1)
+        );
+        assert_eq!(
+            pointer_byte_col_in_text_pane(
+                rect,
+                999.0,
+                16,
+                TextPaneKind::Ascii,
+                Some(pos2(209.0, 40.0))
+            ),
+            Some(15)
+        );
+    }
 }
