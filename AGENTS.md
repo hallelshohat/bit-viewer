@@ -37,6 +37,16 @@ Keep UI constants near the top of `app.rs`. Add brief comments only where bit la
 
 Add unit tests close to the implementation using `#[cfg(test)]` modules. Focus tests on filter semantics, row packing, offset math, and boundary cases for large files. Name tests by behavior, for example `select_range_preserves_group_order`. Run `cargo test` before opening a PR.
 
+For UI work, do not rely on code inspection alone. Run the native app and verify both visuals and behavior:
+
+- launch with a real file using `cargo run -- /path/to/file` so the viewer opens directly into a loaded state
+- check both the empty state and a loaded multi-row file
+- verify pane widths, text contrast, bit-grid readability, and status/footer wrapping at the default window size
+- exercise at least the main viewer shortcuts: `h`, `Home`, `End`, `Page Up`, and `Page Down`
+- confirm bit, hex, and ASCII panes stay aligned while scrolling
+- capture screenshots for before/after comparisons; in headless Linux environments, use `Xvfb` plus `import -window root ...` to inspect the UI visually
+- still run `cargo fmt --all`, `cargo build`, and `cargo test` after UI changes
+
 ## Commit & Pull Request Guidelines
 
 Recent history is short and inconsistent (`init commit`, `nice`, `remove fullstack:`). Prefer clear imperative commits such as `viewer: sync hex and ascii scroll`. Keep each commit focused.

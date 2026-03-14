@@ -300,14 +300,43 @@ fn parse_preamble_bits(bits: &str) -> Result<Vec<u8>, String> {
         return Err("Preamble bits cannot be empty.".to_owned());
     }
 
+    if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        return parse_hex_preamble_bits(hex);
+    }
+
     trimmed
         .chars()
         .map(|character| match character {
             '0' => Ok(0),
             '1' => Ok(1),
-            _ => Err("Preamble bits must contain only 0 or 1.".to_owned()),
+            _ => Err(
+                "Preamble bits must contain only 0 or 1, or use a 0x-prefixed hex value."
+                    .to_owned(),
+            ),
         })
         .collect()
+}
+
+fn parse_hex_preamble_bits(hex: &str) -> Result<Vec<u8>, String> {
+    if hex.is_empty() {
+        return Err("Hex preamble cannot be empty after the 0x prefix.".to_owned());
+    }
+
+    let mut bits = Vec::with_capacity(hex.len().saturating_mul(4));
+    for character in hex.chars() {
+        let nibble = character.to_digit(16).ok_or_else(|| {
+            "Hex preamble must contain only hexadecimal digits after the 0x prefix.".to_owned()
+        })? as u8;
+
+        for shift in (0..4).rev() {
+            bits.push((nibble >> shift) & 1);
+        }
+    }
+
+    Ok(bits)
 }
 
 fn find_group_starts(buffer: &BitBuffer, pattern: &[u8]) -> Vec<usize> {
@@ -350,7 +379,7 @@ fn mask_unused_tail_bits(bytes: &mut [u8], bit_len: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{DerivedView, FilterPipeline, FilterStep, build_derived_view};
+    use super::{DerivedView, FilterPipeline, FilterStep, build_derived_view, parse_preamble_bits};
 
     fn group_bits(view: &DerivedView) -> Vec<Vec<u8>> {
         view.groups()
@@ -441,5 +470,29 @@ mod tests {
 
         let error = build_derived_view(&bytes, &pipeline).expect_err("pipeline should fail");
         assert!(error.contains("requires a grouping step"));
+    }
+
+    #[test]
+    fn parse_preamble_bits_accepts_hex_input() {
+        let bits = parse_preamble_bits("0xA5").expect("hex preamble should parse");
+
+        assert_eq!(bits, vec![1, 0, 1, 0, 0, 1, 0, 1]);
+    }
+
+    #[test]
+    fn sync_on_preamble_accepts_hex_input() {
+        let bytes = [0b1010_0001, 0b1010_1111];
+        let pipeline = FilterPipeline {
+            steps: vec![FilterStep::SyncOnPreamble {
+                bits: "0xA".to_owned(),
+            }],
+        };
+
+        let view = build_derived_view(&bytes, &pipeline).expect("pipeline should succeed");
+
+        assert_eq!(
+            group_bits(&view),
+            vec![vec![1, 0, 1, 0, 0, 0, 0, 1], vec![1, 0, 1, 0, 1, 1, 1, 1],]
+        );
     }
 }

@@ -4,8 +4,10 @@ mod filters;
 mod viewer;
 
 use app::BitViewerApp;
+use std::path::PathBuf;
 
 fn main() -> eframe::Result<()> {
+    let initial_path = std::env::args_os().nth(1).map(PathBuf::from);
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Bit Viewer Desktop")
@@ -17,6 +19,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Bit Viewer Desktop",
         options,
-        Box::new(|cc| Ok(Box::new(BitViewerApp::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(BitViewerApp::new(cc, initial_path.clone())))),
     )
 }
