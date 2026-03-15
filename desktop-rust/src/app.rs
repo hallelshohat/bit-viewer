@@ -22,7 +22,7 @@ use crate::export::{
     ExportFormat, LinkTypeOption, PcapExportOptions, WAV_CODEC_PRESETS, WavExportOptions,
     default_export_file_name, export_flattened_bits, export_pcap, export_wav, known_link_types,
 };
-use crate::filters::{DerivedView, FilterPipeline, FilterStep};
+use crate::filters::{DerivedView, FilterPipeline, FilterStep, L2Protocol};
 use crate::viewer::{
     BIT_VALUE_NO_DATA, RowData, RowLayout, bit_offset_to_row, build_bit_window, build_row,
     build_row_layout,
@@ -1704,6 +1704,26 @@ impl BitViewerApp {
                                 ui.end_row();
                             });
                     }
+                    FilterStep::ExtractL2Packets { protocol } => {
+                        egui::Grid::new(("extract-l2-grid", index))
+                            .num_columns(2)
+                            .spacing(egui::vec2(12.0, 10.0))
+                            .show(ui, |ui| {
+                                ui.label(RichText::new("Protocol").color(TEXT_MUTED));
+                                ui.horizontal(|ui| {
+                                    if ui.small_button("<").clicked() {
+                                        *protocol = protocol.cycle(-1);
+                                        changed = true;
+                                    }
+                                    ui.label(RichText::new(protocol.label()).monospace());
+                                    if ui.small_button(">").clicked() {
+                                        *protocol = protocol.cycle(1);
+                                        changed = true;
+                                    }
+                                });
+                                ui.end_row();
+                            });
+                    }
                 }
             });
         }
@@ -1775,6 +1795,14 @@ impl BitViewerApp {
                     changed = true;
                 }
                 ui.end_row();
+
+                if ui.button("Extract L2 packets").clicked() {
+                    self.pipeline.steps.push(FilterStep::ExtractL2Packets {
+                        protocol: L2Protocol::Ethernet,
+                    });
+                    changed = true;
+                }
+                ui.end_row();
             });
 
         if ui
@@ -1828,6 +1856,9 @@ impl BitViewerApp {
                     FilterStep::SelectBitRangeFromGroup {
                         start_bit: 0,
                         length_bits: 0,
+                    },
+                    FilterStep::ExtractL2Packets {
+                        protocol: L2Protocol::Ethernet,
                     },
                 ];
 

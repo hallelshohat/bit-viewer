@@ -9,6 +9,61 @@ impl FilterPipeline {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum L2Protocol {
+    #[default]
+    Ethernet,
+    PppAsync,
+    PppHdlcLike,
+    Hdlc,
+    Sdlc,
+    CiscoHdlc,
+}
+
+impl L2Protocol {
+    pub const ALL: [Self; 6] = [
+        Self::Ethernet,
+        Self::PppAsync,
+        Self::PppHdlcLike,
+        Self::Hdlc,
+        Self::Sdlc,
+        Self::CiscoHdlc,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ethernet => "Ethernet",
+            Self::PppAsync => "PPP (async)",
+            Self::PppHdlcLike => "PPP (HDLC-like)",
+            Self::Hdlc => "HDLC",
+            Self::Sdlc => "SDLC",
+            Self::CiscoHdlc => "Cisco HDLC",
+        }
+    }
+
+    fn no_packets_error(self) -> String {
+        format!(
+            "No {} packets were found in the current stream.",
+            self.label()
+        )
+    }
+
+    pub fn cycle(self, delta: isize) -> Self {
+        let protocols = Self::ALL;
+        let current_index = protocols
+            .iter()
+            .position(|candidate| *candidate == self)
+            .unwrap_or(0);
+        let len = protocols.len() as isize;
+        let next_index = (current_index as isize + delta).rem_euclid(len) as usize;
+        protocols[next_index]
+    }
+
+    fn requires_byte_alignment(self) -> bool {
+        matches!(self, Self::Ethernet | Self::PppAsync)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FilterStep {
     SyncOnPreamble {
@@ -30,6 +85,9 @@ pub enum FilterStep {
         start_bit: usize,
         length_bits: usize,
     },
+    ExtractL2Packets {
+        protocol: L2Protocol,
+    },
 }
 
 impl FilterStep {
@@ -43,6 +101,7 @@ impl FilterStep {
             Self::Flatten => "Flatten groups",
             Self::KeepGroupsLongerThanBytes { .. } => "Keep groups longer than bytes",
             Self::SelectBitRangeFromGroup { .. } => "Select bit range from group",
+            Self::ExtractL2Packets { .. } => "Extract L2 packets",
         }
     }
 
@@ -69,6 +128,9 @@ impl FilterStep {
             }
             Self::SelectBitRangeFromGroup { .. } => {
                 "Keep only a fixed bit range from each group and discard the rest."
+            }
+            Self::ExtractL2Packets { .. } => {
+                "Split the current stream into packet groups using Ethernet preambles, PPP byte-stuffed flags, or HDLC-family bit-stuffed flags."
             }
         }
     }
@@ -164,6 +226,14 @@ impl BitBuffer {
         Self { bytes, bit_len }
     }
 
+    fn from_bits(bits: impl IntoIterator<Item = u8>) -> Self {
+        let mut buffer = Self::default();
+        for bit in bits {
+            buffer.push_bit(bit);
+        }
+        buffer
+    }
+
     fn len_bits(&self) -> usize {
         self.bit_len
     }
@@ -174,6 +244,10 @@ impl BitBuffer {
 
     fn is_empty(&self) -> bool {
         self.bit_len == 0
+    }
+
+    fn is_byte_aligned(&self) -> bool {
+        self.bit_len % 8 == 0
     }
 
     fn bytes(&self) -> &[u8] {
@@ -379,7 +453,233 @@ fn apply_step(state: PipelineState, step: &FilterStep) -> Result<PipelineState, 
                     .collect(),
             )),
         },
+        FilterStep::ExtractL2Packets { protocol } => extract_l2_packets(state, *protocol),
     }
+}
+
+fn extract_l2_packets(state: PipelineState, protocol: L2Protocol) -> Result<PipelineState, String> {
+    let groups = match state {
+        PipelineState::Flat(buffer) => vec![buffer],
+        PipelineState::Grouped(groups) => groups,
+    };
+
+    let mut extracted = Vec::new();
+    for group in groups {
+        if group.is_empty() {
+            continue;
+        }
+
+        if protocol.requires_byte_alignment() && !group.is_byte_aligned() {
+            return Err(format!(
+                "{} extraction requires byte-aligned input. Current group length is {} bits.",
+                protocol.label(),
+                group.len_bits()
+            ));
+        }
+
+        extracted.extend(extract_packets_from_group(&group, protocol)?);
+    }
+
+    if extracted.is_empty() {
+        return Err(protocol.no_packets_error());
+    }
+
+    Ok(PipelineState::Grouped(extracted))
+}
+
+fn extract_packets_from_group(
+    group: &BitBuffer,
+    protocol: L2Protocol,
+) -> Result<Vec<BitBuffer>, String> {
+    match protocol {
+        L2Protocol::Ethernet => Ok(extract_ethernet_packets(group)),
+        L2Protocol::PppAsync => Ok(extract_ppp_async_packets(group)),
+        L2Protocol::PppHdlcLike | L2Protocol::Hdlc | L2Protocol::Sdlc | L2Protocol::CiscoHdlc => {
+            Ok(extract_hdlc_like_packets(group))
+        }
+    }
+}
+
+const ETHERNET_PREAMBLE_BYTES: [u8; 8] = [0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0xD5];
+const ETHERNET_MIN_FRAME_BYTES: usize = 64;
+const ETHERNET_MAX_FRAME_BYTES: usize = 1_522;
+const ETHERNET_VLAN_ETHERTYPES: [u16; 3] = [0x8100, 0x88A8, 0x9100];
+const PPP_FLAG_BYTE: u8 = 0x7E;
+const PPP_ESCAPE_BYTE: u8 = 0x7D;
+const HDLC_FLAG_BITS: [u8; 8] = [0, 1, 1, 1, 1, 1, 1, 0];
+const CRC32_REVERSED_POLYNOMIAL: u32 = 0xEDB8_8320;
+const CRC16_CCITT_REVERSED_POLYNOMIAL: u16 = 0x8408;
+
+fn extract_ethernet_packets(group: &BitBuffer) -> Vec<BitBuffer> {
+    let bytes = group.bytes();
+    let starts = find_byte_pattern(bytes, &ETHERNET_PREAMBLE_BYTES);
+    let mut packets = Vec::new();
+    let mut accepted_until = 0usize;
+
+    for start in starts.iter().copied() {
+        if start < accepted_until {
+            continue;
+        }
+
+        let frame_start = start + ETHERNET_PREAMBLE_BYTES.len();
+        if frame_start >= bytes.len() {
+            continue;
+        }
+
+        let mut candidate_lengths = Vec::new();
+
+        if let Some(explicit_length) = ethernet_frame_length_from_header(bytes, frame_start)
+            .filter(|frame_len| frame_start.saturating_add(*frame_len) <= bytes.len())
+        {
+            push_unique(&mut candidate_lengths, explicit_length);
+        }
+
+        for next_start in starts
+            .iter()
+            .copied()
+            .filter(|next_start| *next_start > start)
+        {
+            let frame_len = next_start.saturating_sub(frame_start);
+            if !(ETHERNET_MIN_FRAME_BYTES..=ETHERNET_MAX_FRAME_BYTES).contains(&frame_len) {
+                continue;
+            }
+            push_unique(&mut candidate_lengths, frame_len);
+        }
+
+        let remaining = bytes.len().saturating_sub(frame_start);
+        if (ETHERNET_MIN_FRAME_BYTES..=ETHERNET_MAX_FRAME_BYTES).contains(&remaining) {
+            push_unique(&mut candidate_lengths, remaining);
+        }
+
+        for frame_len in candidate_lengths {
+            let frame_end = frame_start + frame_len;
+            let frame = &bytes[frame_start..frame_end];
+            if is_good_ethernet_frame(frame) {
+                packets.push(BitBuffer::from_bytes(frame.to_vec()));
+                accepted_until = frame_end;
+                break;
+            }
+        }
+    }
+
+    packets
+}
+
+fn ethernet_frame_length_from_header(bytes: &[u8], frame_start: usize) -> Option<usize> {
+    let mut header_len = 14usize;
+    let mut field_offset = frame_start + 12;
+
+    loop {
+        let value = read_u16_be(bytes, field_offset)?;
+        if ETHERNET_VLAN_ETHERTYPES.contains(&value) {
+            header_len += 4;
+            field_offset += 4;
+            continue;
+        }
+
+        if value <= 1_500 {
+            return Some((header_len + value as usize + 4).max(ETHERNET_MIN_FRAME_BYTES));
+        }
+
+        return None;
+    }
+}
+
+fn extract_ppp_async_packets(group: &BitBuffer) -> Vec<BitBuffer> {
+    let bytes = group.bytes();
+    let mut packets = Vec::new();
+    let mut current_start = None;
+
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if byte != PPP_FLAG_BYTE {
+            continue;
+        }
+
+        if let Some(start) = current_start
+            && start < index
+            && let Some(packet) = decode_ppp_async_packet(&bytes[start..index])
+        {
+            packets.push(BitBuffer::from_bytes(packet));
+        }
+
+        current_start = Some(index + 1);
+    }
+
+    packets
+}
+
+fn decode_ppp_async_packet(bytes: &[u8]) -> Option<Vec<u8>> {
+    if bytes.is_empty() {
+        return None;
+    }
+
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == PPP_ESCAPE_BYTE {
+            index += 1;
+            let escaped = *bytes.get(index)?;
+            decoded.push(escaped ^ 0x20);
+        } else {
+            decoded.push(byte);
+        }
+        index += 1;
+    }
+
+    (!decoded.is_empty()).then_some(decoded)
+}
+
+fn extract_hdlc_like_packets(group: &BitBuffer) -> Vec<BitBuffer> {
+    let starts = find_group_starts(group, &HDLC_FLAG_BITS);
+    let mut packets = Vec::new();
+
+    for window in starts.windows(2) {
+        let start_bit = window[0] + HDLC_FLAG_BITS.len();
+        let end_bit = window[1];
+        if end_bit <= start_bit {
+            continue;
+        }
+
+        let stuffed = group.slice_bits(start_bit, end_bit - start_bit);
+        let Some(packet) = destuff_hdlc_bits(&stuffed) else {
+            continue;
+        };
+        if is_good_hdlc_frame(&packet) {
+            packets.push(packet);
+        }
+    }
+
+    packets
+}
+
+fn destuff_hdlc_bits(stuffed: &BitBuffer) -> Option<BitBuffer> {
+    let mut bits = Vec::with_capacity(stuffed.len_bits());
+    let mut consecutive_ones = 0usize;
+
+    for bit_index in 0..stuffed.len_bits() {
+        let bit = stuffed.bit(bit_index)?;
+        match bit {
+            1 => {
+                consecutive_ones += 1;
+                if consecutive_ones > 5 {
+                    return None;
+                }
+                bits.push(1);
+            }
+            0 => {
+                if consecutive_ones == 5 {
+                    consecutive_ones = 0;
+                    continue;
+                }
+                consecutive_ones = 0;
+                bits.push(0);
+            }
+            _ => return None,
+        }
+    }
+
+    Some(BitBuffer::from_bits(bits))
 }
 
 fn parse_preamble_bits(bits: &str) -> Result<Vec<u8>, String> {
@@ -453,6 +753,140 @@ fn pattern_matches(buffer: &BitBuffer, start_bit: usize, pattern: &[u8]) -> bool
         .all(|(index, expected)| buffer.bit(start_bit + index) == Some(*expected))
 }
 
+fn find_byte_pattern(bytes: &[u8], pattern: &[u8]) -> Vec<usize> {
+    if pattern.is_empty() || pattern.len() > bytes.len() {
+        return Vec::new();
+    }
+
+    let mut starts = Vec::new();
+    let mut index = 0usize;
+    while index + pattern.len() <= bytes.len() {
+        if &bytes[index..index + pattern.len()] == pattern {
+            starts.push(index);
+            index += pattern.len();
+        } else {
+            index += 1;
+        }
+    }
+
+    starts
+}
+
+fn read_u16_be(bytes: &[u8], start: usize) -> Option<u16> {
+    let high = *bytes.get(start)? as u16;
+    let low = *bytes.get(start + 1)? as u16;
+    Some((high << 8) | low)
+}
+
+fn read_u16_le(bytes: &[u8], start: usize) -> Option<u16> {
+    let low = *bytes.get(start)? as u16;
+    let high = *bytes.get(start + 1)? as u16;
+    Some(low | (high << 8))
+}
+
+fn read_u32_le(bytes: &[u8], start: usize) -> Option<u32> {
+    let b0 = *bytes.get(start)? as u32;
+    let b1 = *bytes.get(start + 1)? as u32;
+    let b2 = *bytes.get(start + 2)? as u32;
+    let b3 = *bytes.get(start + 3)? as u32;
+    Some(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))
+}
+
+fn push_unique(values: &mut Vec<usize>, value: usize) {
+    if !values.contains(&value) {
+        values.push(value);
+    }
+}
+
+fn is_good_ethernet_frame(frame: &[u8]) -> bool {
+    if !(ETHERNET_MIN_FRAME_BYTES..=ETHERNET_MAX_FRAME_BYTES).contains(&frame.len()) {
+        return false;
+    }
+
+    let frame_without_fcs_len = frame.len().saturating_sub(4);
+    if frame_without_fcs_len < 14 {
+        return false;
+    }
+
+    let Some(actual_fcs) = read_u32_le(frame, frame_without_fcs_len) else {
+        return false;
+    };
+    let expected_fcs = crc32_fcs(&frame[..frame_without_fcs_len]);
+
+    actual_fcs == expected_fcs
+}
+
+fn is_good_hdlc_frame(frame: &BitBuffer) -> bool {
+    if frame.is_empty() || !frame.is_byte_aligned() {
+        return false;
+    }
+
+    let bytes = frame.bytes();
+    has_valid_hdlc_fcs16(bytes) || has_valid_hdlc_fcs32(bytes)
+}
+
+fn has_valid_hdlc_fcs16(frame: &[u8]) -> bool {
+    if frame.len() < 3 {
+        return false;
+    }
+
+    let payload_len = frame.len() - 2;
+    let Some(actual_fcs) = read_u16_le(frame, payload_len) else {
+        return false;
+    };
+
+    actual_fcs == crc16_ccitt_fcs(&frame[..payload_len])
+}
+
+fn has_valid_hdlc_fcs32(frame: &[u8]) -> bool {
+    if frame.len() < 5 {
+        return false;
+    }
+
+    let payload_len = frame.len() - 4;
+    let Some(actual_fcs) = read_u32_le(frame, payload_len) else {
+        return false;
+    };
+
+    actual_fcs == crc32_fcs(&frame[..payload_len])
+}
+
+fn crc16_ccitt_fcs(bytes: &[u8]) -> u16 {
+    let mut crc = 0xFFFFu16;
+
+    for &byte in bytes {
+        let mut current = byte as u16;
+        for _ in 0..8 {
+            let mix = (crc ^ current) & 1;
+            crc >>= 1;
+            if mix != 0 {
+                crc ^= CRC16_CCITT_REVERSED_POLYNOMIAL;
+            }
+            current >>= 1;
+        }
+    }
+
+    !crc
+}
+
+fn crc32_fcs(bytes: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+
+    for &byte in bytes {
+        let mut current = byte as u32;
+        for _ in 0..8 {
+            let mix = (crc ^ current) & 1;
+            crc >>= 1;
+            if mix != 0 {
+                crc ^= CRC32_REVERSED_POLYNOMIAL;
+            }
+            current >>= 1;
+        }
+    }
+
+    !crc
+}
+
 fn mask_unused_tail_bits(bytes: &mut [u8], bit_len: usize) {
     let remainder = bit_len % 8;
     if remainder == 0 {
@@ -467,7 +901,10 @@ fn mask_unused_tail_bits(bytes: &mut [u8], bit_len: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{DerivedView, FilterPipeline, FilterStep, build_derived_view, parse_preamble_bits};
+    use super::{
+        DerivedView, FilterPipeline, FilterStep, L2Protocol, build_derived_view,
+        parse_preamble_bits,
+    };
 
     fn group_bits(view: &DerivedView) -> Vec<Vec<u8>> {
         view.groups()
@@ -478,6 +915,84 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    fn group_bytes(view: &DerivedView) -> Vec<Vec<u8>> {
+        view.groups()
+            .iter()
+            .map(|group| group.packed_bytes().to_vec())
+            .collect()
+    }
+
+    fn ethernet_length_frame(payload: &[u8], filler: u8) -> Vec<u8> {
+        let mut frame_without_fcs = vec![
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25,
+        ];
+        frame_without_fcs.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        frame_without_fcs.extend_from_slice(payload);
+
+        let min_without_fcs = super::ETHERNET_MIN_FRAME_BYTES - 4;
+        if frame_without_fcs.len() < min_without_fcs {
+            frame_without_fcs.resize(min_without_fcs, filler);
+        }
+
+        let mut frame = frame_without_fcs.clone();
+        frame.extend_from_slice(&super::crc32_fcs(&frame_without_fcs).to_le_bytes());
+        frame
+    }
+
+    fn bits_to_bytes(bits: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(bits.len().div_ceil(8));
+        for (index, bit) in bits.iter().copied().enumerate() {
+            if index % 8 == 0 {
+                bytes.push(0);
+            }
+            if bit != 0 {
+                let shift = 7 - (index % 8);
+                let last_index = bytes.len() - 1;
+                bytes[last_index] |= 1 << shift;
+            }
+        }
+        bytes
+    }
+
+    fn bytes_to_bits(bytes: &[u8]) -> Vec<u8> {
+        let mut bits = Vec::with_capacity(bytes.len().saturating_mul(8));
+        for &byte in bytes {
+            for shift in (0..8).rev() {
+                bits.push((byte >> shift) & 1);
+            }
+        }
+        bits
+    }
+
+    fn hdlc_frame_bytes(payload: &[u8]) -> Vec<u8> {
+        let mut frame = payload.to_vec();
+        frame.extend_from_slice(&super::crc16_ccitt_fcs(payload).to_le_bytes());
+        frame
+    }
+
+    fn hdlc_wrap_bytes(frame: &[u8]) -> Vec<u8> {
+        let payload_bits = bytes_to_bits(frame);
+        let mut stuffed = Vec::with_capacity(payload_bits.len() + 16);
+        stuffed.extend_from_slice(&super::HDLC_FLAG_BITS);
+
+        let mut consecutive_ones = 0usize;
+        for bit in payload_bits {
+            stuffed.push(bit);
+            if bit == 1 {
+                consecutive_ones += 1;
+                if consecutive_ones == 5 {
+                    stuffed.push(0);
+                    consecutive_ones = 0;
+                }
+            } else {
+                consecutive_ones = 0;
+            }
+        }
+
+        stuffed.extend_from_slice(&super::HDLC_FLAG_BITS);
+        bits_to_bytes(&stuffed)
     }
 
     #[test]
@@ -643,5 +1158,130 @@ mod tests {
             group_bits(&view),
             vec![vec![1, 0, 1, 0, 0, 0, 0, 1], vec![1, 0, 1, 0, 1, 1, 1, 1],]
         );
+    }
+
+    #[test]
+    fn extract_l2_packets_splits_ethernet_frames_on_preamble() {
+        let frame_one = ethernet_length_frame(&[0xDE, 0xAD, 0xBE, 0xEF], 0xA1);
+        let frame_two = ethernet_length_frame(&[0x01, 0x02, 0x03, 0x04, 0x05], 0xB2);
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&super::ETHERNET_PREAMBLE_BYTES);
+        bytes.extend_from_slice(&frame_one);
+        bytes.extend_from_slice(&super::ETHERNET_PREAMBLE_BYTES);
+        bytes.extend_from_slice(&frame_two);
+
+        let pipeline = FilterPipeline {
+            steps: vec![FilterStep::ExtractL2Packets {
+                protocol: L2Protocol::Ethernet,
+            }],
+        };
+
+        let view = build_derived_view(&bytes, &pipeline).expect("ethernet extraction should work");
+
+        assert_eq!(group_bytes(&view), vec![frame_one, frame_two]);
+    }
+
+    #[test]
+    fn extract_l2_packets_decodes_async_ppp_escapes() {
+        let bytes = [
+            0x7E, 0xFF, 0x03, 0x00, 0x21, 0x7D, 0x5E, 0x7D, 0x5D, 0x45, 0x12, 0x34, 0x7E,
+        ];
+        let pipeline = FilterPipeline {
+            steps: vec![FilterStep::ExtractL2Packets {
+                protocol: L2Protocol::PppAsync,
+            }],
+        };
+
+        let view = build_derived_view(&bytes, &pipeline).expect("ppp extraction should work");
+
+        assert_eq!(
+            group_bytes(&view),
+            vec![vec![0xFF, 0x03, 0x00, 0x21, 0x7E, 0x7D, 0x45, 0x12, 0x34]]
+        );
+    }
+
+    #[test]
+    fn extract_l2_packets_destuffs_hdlc_payload_bits() {
+        let frame = hdlc_frame_bytes(&[0xF8, 0xA0]);
+        let bytes = hdlc_wrap_bytes(&frame);
+        let pipeline = FilterPipeline {
+            steps: vec![FilterStep::ExtractL2Packets {
+                protocol: L2Protocol::Hdlc,
+            }],
+        };
+
+        let view = build_derived_view(&bytes, &pipeline).expect("hdlc extraction should work");
+
+        assert_eq!(group_bytes(&view), vec![frame]);
+    }
+
+    #[test]
+    fn extract_l2_packets_requires_byte_alignment_for_ethernet() {
+        let groups = vec![vec![0x55, 0x55]];
+        let pipeline = FilterPipeline {
+            steps: vec![
+                FilterStep::SyncOnPreamble {
+                    bits: "101".to_owned(),
+                },
+                FilterStep::ExtractL2Packets {
+                    protocol: L2Protocol::Ethernet,
+                },
+            ],
+        };
+
+        let error = super::build_derived_view_from_groups(&groups, &pipeline)
+            .expect_err("misaligned ethernet extraction should fail");
+
+        assert!(error.contains("byte-aligned"));
+    }
+
+    #[test]
+    fn extract_l2_packets_drops_ethernet_frames_with_bad_fcs() {
+        let mut bad_frame = ethernet_length_frame(&[0xAA, 0xBB, 0xCC], 0x11);
+        let last_index = bad_frame.len() - 1;
+        bad_frame[last_index] ^= 0xFF;
+
+        let good_frame = ethernet_length_frame(&[0xDE, 0xAD, 0xBE, 0xEF], 0x22);
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&super::ETHERNET_PREAMBLE_BYTES);
+        bytes.extend_from_slice(&bad_frame);
+        bytes.extend_from_slice(&super::ETHERNET_PREAMBLE_BYTES);
+        bytes.extend_from_slice(&good_frame);
+
+        let pipeline = FilterPipeline {
+            steps: vec![FilterStep::ExtractL2Packets {
+                protocol: L2Protocol::Ethernet,
+            }],
+        };
+
+        let view =
+            build_derived_view(&bytes, &pipeline).expect("good ethernet frame should remain");
+
+        assert_eq!(group_bytes(&view), vec![good_frame]);
+    }
+
+    #[test]
+    fn extract_l2_packets_drops_hdlc_frames_with_bad_fcs() {
+        let mut bad_frame = hdlc_frame_bytes(&[0xA5, 0x5A]);
+        let last_index = bad_frame.len() - 1;
+        bad_frame[last_index] ^= 0xFF;
+
+        let good_frame = hdlc_frame_bytes(&[0xF8, 0xA0]);
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&hdlc_wrap_bytes(&bad_frame));
+        bytes.extend_from_slice(&hdlc_wrap_bytes(&good_frame));
+
+        let pipeline = FilterPipeline {
+            steps: vec![FilterStep::ExtractL2Packets {
+                protocol: L2Protocol::Hdlc,
+            }],
+        };
+
+        let view = build_derived_view(&bytes, &pipeline).expect("good hdlc frame should remain");
+
+        assert_eq!(group_bytes(&view), vec![good_frame]);
     }
 }
