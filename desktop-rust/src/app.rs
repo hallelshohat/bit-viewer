@@ -1604,6 +1604,25 @@ impl BitViewerApp {
                             changed = true;
                         }
                     }
+                    FilterStep::Split { group_size_bits } => {
+                        egui::Grid::new(("split-grid", index))
+                            .num_columns(2)
+                            .spacing(egui::vec2(12.0, 10.0))
+                            .show(ui, |ui| {
+                                ui.label(RichText::new("Group size bits").color(TEXT_MUTED));
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(group_size_bits)
+                                            .range(1..=usize::MAX)
+                                            .speed(1.0),
+                                    )
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
+                                ui.end_row();
+                            });
+                    }
                     FilterStep::Chop { bits } => {
                         egui::Grid::new(("chop-grid", index))
                             .num_columns(2)
@@ -1753,24 +1772,26 @@ impl BitViewerApp {
                     });
                     changed = true;
                 }
+                if ui.button("Split").clicked() {
+                    self.pipeline
+                        .steps
+                        .push(FilterStep::Split { group_size_bits: 8 });
+                    changed = true;
+                }
+                ui.end_row();
+
                 if ui.button("Chop").clicked() {
                     self.pipeline.steps.push(FilterStep::Chop { bits: 8 });
                     changed = true;
                 }
-                ui.end_row();
-
                 if ui.button("Reverse bytes").clicked() {
                     self.pipeline.steps.push(FilterStep::ReverseBitsPerByte);
                     changed = true;
                 }
-                if ui.button("Invert bits").clicked() {
-                    self.pipeline.steps.push(FilterStep::InvertBits);
-                    changed = true;
-                }
                 ui.end_row();
 
-                if ui.button("Flatten").clicked() {
-                    self.pipeline.steps.push(FilterStep::Flatten);
+                if ui.button("Invert bits").clicked() {
+                    self.pipeline.steps.push(FilterStep::InvertBits);
                     changed = true;
                 }
                 if ui.button("XOR mask").clicked() {
@@ -1779,6 +1800,10 @@ impl BitViewerApp {
                 }
                 ui.end_row();
 
+                if ui.button("Flatten").clicked() {
+                    self.pipeline.steps.push(FilterStep::Flatten);
+                    changed = true;
+                }
                 if ui.button("Keep groups > N bytes").clicked() {
                     self.pipeline
                         .steps
@@ -1847,6 +1872,7 @@ impl BitViewerApp {
                     FilterStep::SyncOnPreamble {
                         bits: String::new(),
                     },
+                    FilterStep::Split { group_size_bits: 8 },
                     FilterStep::Chop { bits: 0 },
                     FilterStep::ReverseBitsPerByte,
                     FilterStep::InvertBits,

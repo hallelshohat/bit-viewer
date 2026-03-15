@@ -69,6 +69,9 @@ pub enum FilterStep {
     SyncOnPreamble {
         bits: String,
     },
+    Split {
+        group_size_bits: usize,
+    },
     Chop {
         bits: usize,
     },
@@ -94,6 +97,7 @@ impl FilterStep {
     pub fn label(&self) -> &'static str {
         match self {
             Self::SyncOnPreamble { .. } => "Sync on preamble",
+            Self::Split { .. } => "Split",
             Self::Chop { .. } => "Chop",
             Self::ReverseBitsPerByte => "Reverse bits in each byte",
             Self::InvertBits => "Invert bits",
@@ -109,6 +113,9 @@ impl FilterStep {
         match self {
             Self::SyncOnPreamble { .. } => {
                 "Split the current bitstream into groups whenever the preamble pattern is found."
+            }
+            Self::Split { .. } => {
+                "Flatten the current view, then cut it into fixed-size groups and keep any partial tail group."
             }
             Self::Chop { .. } => {
                 "Remove a fixed number of bits from the start of the file, or from the start of each group once groups exist."
@@ -388,6 +395,25 @@ fn build_derived_view_from_state(
 
 fn apply_step(state: PipelineState, step: &FilterStep) -> Result<PipelineState, String> {
     match step {
+        FilterStep::Split { group_size_bits } => {
+            if *group_size_bits == 0 {
+                return Err("Split filter requires a group size greater than zero bits.".to_owned());
+            }
+
+            let buffer = state.into_flat();
+            let mut groups = Vec::with_capacity(buffer.len_bits().div_ceil(*group_size_bits));
+            let mut start_bit = 0usize;
+            while start_bit < buffer.len_bits() {
+                let length_bits = (*group_size_bits).min(buffer.len_bits() - start_bit);
+                let group = buffer.slice_bits(start_bit, length_bits);
+                if !group.is_empty() {
+                    groups.push(group);
+                }
+                start_bit += *group_size_bits;
+            }
+
+            Ok(PipelineState::Grouped(groups))
+        }
         FilterStep::Chop { bits } => match state {
             PipelineState::Flat(buffer) => Ok(PipelineState::Flat(
                 buffer.slice_bits(*bits, buffer.len_bits().saturating_sub(*bits)),
@@ -1009,6 +1035,53 @@ mod tests {
 
         let view = build_derived_view(&bytes, &pipeline).expect("pipeline should succeed");
         assert_eq!(view.group_count(), 0);
+    }
+
+    #[test]
+    fn split_regroups_flattened_stream_at_fixed_bit_width() {
+        let groups = vec![vec![0xAA], vec![0x55, 0xF0]];
+        let pipeline = FilterPipeline {
+            steps: vec![FilterStep::Split { group_size_bits: 6 }],
+        };
+
+        let view = super::build_derived_view_from_groups(&groups, &pipeline)
+            .expect("split should flatten and regroup");
+
+        assert_eq!(
+            group_bits(&view),
+            vec![
+                vec![1, 0, 1, 0, 1, 0],
+                vec![1, 0, 0, 1, 0, 1],
+                vec![0, 1, 0, 1, 1, 1],
+                vec![1, 1, 0, 0, 0, 0],
+            ]
+        );
+    }
+
+    #[test]
+    fn split_preserves_partial_tail_group() {
+        let bytes = [0b1101_0011];
+        let pipeline = FilterPipeline {
+            steps: vec![FilterStep::Split { group_size_bits: 3 }],
+        };
+
+        let view = build_derived_view(&bytes, &pipeline).expect("split should succeed");
+
+        assert_eq!(
+            group_bits(&view),
+            vec![vec![1, 1, 0], vec![1, 0, 0], vec![1, 1]]
+        );
+    }
+
+    #[test]
+    fn split_rejects_zero_sized_groups() {
+        let bytes = [0b1111_0000];
+        let pipeline = FilterPipeline {
+            steps: vec![FilterStep::Split { group_size_bits: 0 }],
+        };
+
+        let error = build_derived_view(&bytes, &pipeline).expect_err("split should fail");
+        assert!(error.contains("greater than zero bits"));
     }
 
     #[test]
