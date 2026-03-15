@@ -241,8 +241,24 @@ impl PipelineState {
 }
 
 pub fn build_derived_view(bytes: &[u8], pipeline: &FilterPipeline) -> Result<DerivedView, String> {
-    let mut state = PipelineState::Flat(BitBuffer::from_bytes(bytes.to_vec()));
+    build_derived_view_from_state(
+        PipelineState::Flat(BitBuffer::from_bytes(bytes.to_vec())),
+        pipeline,
+    )
+}
 
+pub fn build_derived_view_from_groups(
+    groups: &[Vec<u8>],
+    pipeline: &FilterPipeline,
+) -> Result<DerivedView, String> {
+    let state = PipelineState::Grouped(groups.iter().cloned().map(BitBuffer::from_bytes).collect());
+    build_derived_view_from_state(state, pipeline)
+}
+
+fn build_derived_view_from_state(
+    mut state: PipelineState,
+    pipeline: &FilterPipeline,
+) -> Result<DerivedView, String> {
     for step in &pipeline.steps {
         state = apply_step(state, step)?;
     }
@@ -485,6 +501,22 @@ mod tests {
 
         let view = build_derived_view(&bytes, &pipeline).expect("pipeline should succeed");
         assert_eq!(group_bits(&view), vec![vec![1, 1, 1, 1, 0, 0, 0, 0]]);
+    }
+
+    #[test]
+    fn grouped_input_preserves_packet_boundaries_without_filters() {
+        let groups = vec![vec![0xAA], vec![0x55, 0xF0]];
+
+        let view = super::build_derived_view_from_groups(&groups, &Default::default())
+            .expect("grouped source should succeed");
+
+        assert_eq!(
+            group_bits(&view),
+            vec![
+                vec![1, 0, 1, 0, 1, 0, 1, 0],
+                vec![0, 1, 0, 1, 0, 1, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0],
+            ]
+        );
     }
 
     #[test]

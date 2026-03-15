@@ -6,8 +6,8 @@ use std::thread;
 use std::time::Duration;
 
 use eframe::egui::{
-    self, Align, Color32, Context, CornerRadius, FontFamily, FontId, Key, Layout, Rect, RichText,
-    ScrollArea, Stroke, TextureHandle, Ui, Vec2,
+    self, Align, Color32, Context, CornerRadius, FontFamily, FontId, Key, Layout, PointerButton,
+    Rect, RichText, ScrollArea, Stroke, TextureHandle, Ui, Vec2,
 };
 use egui::containers::menu::{MenuButton, MenuConfig};
 use rfd::FileDialog;
@@ -17,7 +17,7 @@ use crate::export::{
     ExportFormat, LinkTypeOption, PcapExportOptions, WAV_CODEC_PRESETS, WavExportOptions,
     default_export_file_name, export_flattened_bits, export_pcap, export_wav, known_link_types,
 };
-use crate::filters::{DerivedView, FilterPipeline, FilterStep, build_derived_view};
+use crate::filters::{DerivedView, FilterPipeline, FilterStep};
 use crate::viewer::{
     BIT_VALUE_NO_DATA, RowData, RowLayout, bit_offset_to_row, build_bit_window, build_row,
     build_row_layout,
@@ -59,7 +59,7 @@ const SUCCESS_BORDER: Color32 = Color32::from_rgb(54, 122, 96);
 const HEX_COLUMN_MIN_WIDTH: f32 = 260.0;
 const ASCII_COLUMN_MIN_WIDTH: f32 = 150.0;
 const ASCII_COLUMN_DEFAULT_WIDTH: f32 = 180.0;
-const ASCII_COLUMN_CHAR_WIDTH: f32 = 8.0;
+const TEXT_FONT_SIZE: f32 = 13.0;
 const TEXT_PANEL_MIN_WIDTH: f32 = 460.0;
 const TEXT_PANEL_MAX_SHARE: f32 = 0.42;
 const BIT_PANEL_MIN_WIDTH: f32 = 320.0;
@@ -479,7 +479,8 @@ impl BitViewerApp {
     }
 
     fn finish_active_draw_stroke_on_release(&mut self, context: &Context) {
-        if self.active_draw_stroke.is_some() && !context.input(|input| input.pointer.primary_down())
+        if self.active_draw_stroke.is_some()
+            && !context.input(|input| input.pointer.secondary_down())
         {
             self.active_draw_stroke = None;
         }
@@ -688,15 +689,15 @@ impl BitViewerApp {
         granularity: DrawGranularity,
         index: Option<usize>,
     ) {
-        let (pointer_pos, primary_pressed, primary_down) = ui.ctx().input(|input| {
+        let (pointer_pos, secondary_pressed, secondary_down) = ui.ctx().input(|input| {
             (
                 input.pointer.interact_pos(),
-                input.pointer.primary_pressed(),
-                input.pointer.primary_down(),
+                input.pointer.secondary_pressed(),
+                input.pointer.secondary_down(),
             )
         });
 
-        if !primary_down {
+        if !secondary_down {
             return;
         }
 
@@ -713,7 +714,7 @@ impl BitViewerApp {
             return;
         }
 
-        if primary_pressed {
+        if secondary_pressed {
             self.start_draw_stroke(granularity, index);
             ui.ctx().request_repaint();
             return;
@@ -1049,7 +1050,8 @@ impl BitViewerApp {
         ui.monospace("- / =  bit size");
         ui.monospace("h      toggle text pane");
         ui.monospace("Home / End / PgUp / PgDn  navigation");
-        ui.monospace("Right-click in a pane       align all scroll positions");
+        ui.monospace("Right-click drag in a pane  draw selection");
+        ui.monospace("Middle-click in a pane      align all scroll positions");
     }
 
     fn show_main_content(&mut self, ui: &mut Ui) {
@@ -1318,7 +1320,7 @@ impl BitViewerApp {
         ui.horizontal_wrapped(|ui| {
             if let Some(document) = &self.document {
                 self.status_chip(ui, document.file_name());
-                self.status_chip(ui, &format!("source {} bytes", document.len_bytes()));
+                self.status_chip(ui, &document.source_size_label());
                 self.status_chip(ui, &format!("{} bits", document.len_bits()));
 
                 if let Some(view) = &self.derived_view {
@@ -1450,7 +1452,13 @@ impl BitViewerApp {
                     .num_columns(2)
                     .spacing(egui::vec2(16.0, 10.0))
                     .show(ui, |ui| {
-                        ui.monospace("Right-click in bit / hex / ASCII");
+                        ui.monospace("Right-click drag in bit / hex / ASCII");
+                        ui.label(
+                            RichText::new("Draw or erase highlighted columns").color(TEXT_MUTED),
+                        );
+                        ui.end_row();
+
+                        ui.monospace("Middle-click in bit / hex / ASCII");
                         ui.label(
                             RichText::new("Align all panes to the clicked pane's row")
                                 .color(TEXT_MUTED),
@@ -1925,9 +1933,9 @@ impl BitViewerApp {
         ui.add_space(8.0);
     }
 
-    fn sync_scroll_positions_on_secondary_click(&mut self, ui: &Ui, rect: Rect, row: usize) {
+    fn sync_scroll_positions_on_middle_click(&mut self, ui: &Ui, rect: Rect, row: usize) {
         let should_sync = ui.ctx().input(|input| {
-            input.pointer.secondary_clicked()
+            input.pointer.button_clicked(PointerButton::Middle)
                 && input
                     .pointer
                     .interact_pos()
@@ -1973,7 +1981,10 @@ impl BitViewerApp {
         let bit_row_height = self.bit_size;
         let text_row_height = TEXT_ROW_HEIGHT;
         let bytes_per_row = self.row_width_bits.div_ceil(8);
-        let hex_width = HEX_COLUMN_MIN_WIDTH.max(bytes_per_row as f32 * 19.0);
+        let text_char_width = text_pane_char_width(ui);
+        let hex_content_width =
+            text_pane_content_width(bytes_per_row, TextPaneKind::Hex, text_char_width);
+        let hex_width = HEX_COLUMN_MIN_WIDTH.max(hex_content_width);
         let bit_panel_width = self.row_width_bits as f32 * self.bit_size;
         let bit_content_height = total_rows as f32 * bit_row_height;
         let available_height = ui.available_height();
@@ -2013,6 +2024,7 @@ impl BitViewerApp {
                         text_row_height,
                         text_scroll_target_row,
                         bytes_per_row,
+                        text_char_width,
                         hex_width,
                     );
                 });
@@ -2193,7 +2205,7 @@ impl BitViewerApp {
                         ui.ctx().input(|input| input.pointer.interact_pos()),
                     ),
                 );
-                self.sync_scroll_positions_on_secondary_click(
+                self.sync_scroll_positions_on_middle_click(
                     ui,
                     output.inner_rect,
                     observed_bit_scroll_row,
@@ -2212,6 +2224,7 @@ impl BitViewerApp {
         text_row_height: f32,
         text_scroll_target_row: usize,
         bytes_per_row: usize,
+        text_char_width: f32,
         hex_width: f32,
     ) -> usize {
         ui.set_min_height(available_height);
@@ -2223,8 +2236,11 @@ impl BitViewerApp {
             .min((total_width * 0.38).max(ASCII_COLUMN_MIN_WIDTH));
         let hex_panel_width =
             (total_width - ascii_panel_width - VIEWER_PANEL_GAP).max(HEX_COLUMN_MIN_WIDTH);
-        let ascii_content_width = ASCII_COLUMN_MIN_WIDTH
-            .max(bytes_per_row as f32 * ASCII_COLUMN_CHAR_WIDTH + TEXT_CELL_PADDING_X * 2.0);
+        let ascii_content_width = ASCII_COLUMN_MIN_WIDTH.max(text_pane_content_width(
+            bytes_per_row,
+            TextPaneKind::Ascii,
+            text_char_width,
+        ));
         let mut hex_observed_row = self.current_text_scroll_row;
         let mut ascii_observed_row = self.current_text_scroll_row;
 
@@ -2279,6 +2295,7 @@ impl BitViewerApp {
                                             TEXT_PRIMARY,
                                             start + row_offset,
                                             TextPaneKind::Hex,
+                                            text_char_width,
                                             highlighted_byte_ranges.as_slice(),
                                         );
                                     }
@@ -2295,10 +2312,11 @@ impl BitViewerApp {
                                     output.state.offset.x,
                                     bytes_per_row,
                                     TextPaneKind::Hex,
+                                    text_char_width,
                                     ui.ctx().input(|input| input.pointer.interact_pos()),
                                 ),
                             );
-                            self.sync_scroll_positions_on_secondary_click(
+                            self.sync_scroll_positions_on_middle_click(
                                 ui,
                                 output.inner_rect,
                                 hex_observed_row,
@@ -2353,6 +2371,7 @@ impl BitViewerApp {
                                             TEXT_PRIMARY,
                                             start + row_offset,
                                             TextPaneKind::Ascii,
+                                            text_char_width,
                                             highlighted_byte_ranges.as_slice(),
                                         );
                                     }
@@ -2369,10 +2388,11 @@ impl BitViewerApp {
                                     output.state.offset.x,
                                     bytes_per_row,
                                     TextPaneKind::Ascii,
+                                    text_char_width,
                                     ui.ctx().input(|input| input.pointer.interact_pos()),
                                 ),
                             );
-                            self.sync_scroll_positions_on_secondary_click(
+                            self.sync_scroll_positions_on_middle_click(
                                 ui,
                                 output.inner_rect,
                                 ascii_observed_row,
@@ -2711,7 +2731,7 @@ impl BitViewerApp {
 
         thread::spawn(move || {
             let result = BinaryDocument::open(&path)
-                .and_then(|document| build_derived_view(document.as_bytes(), &pipeline));
+                .and_then(|document| document.build_derived_view(&pipeline));
             let _ = sender.send(DerivedBuildResult { request_id, result });
         });
     }
@@ -3068,6 +3088,7 @@ fn pointer_byte_col_in_text_pane(
     horizontal_scroll: f32,
     bytes_per_row: usize,
     pane_kind: TextPaneKind,
+    text_char_width: f32,
     pointer_pos: Option<egui::Pos2>,
 ) -> Option<usize> {
     if bytes_per_row == 0 {
@@ -3075,7 +3096,7 @@ fn pointer_byte_col_in_text_pane(
     }
 
     let pointer_pos = pointer_pos?;
-    let cell_width = text_pane_column_step(pane_kind);
+    let cell_width = text_pane_column_step(pane_kind, text_char_width);
     let local_x =
         ((pointer_pos.x - rect.left()) + horizontal_scroll - TEXT_CELL_PADDING_X).max(0.0);
     Some(((local_x / cell_width).floor().max(0.0) as usize).min(bytes_per_row.saturating_sub(1)))
@@ -3089,6 +3110,7 @@ fn paint_single_text_row(
     color: Color32,
     row_index: usize,
     pane_kind: TextPaneKind,
+    text_char_width: f32,
     highlighted_byte_ranges: &[(usize, usize)],
 ) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, row_height), egui::Sense::hover());
@@ -3098,12 +3120,18 @@ fn paint_single_text_row(
         SURFACE_ALT_BG
     };
     ui.painter().rect_filled(rect, CornerRadius::ZERO, row_fill);
-    paint_text_column_overlay(ui, rect, pane_kind, highlighted_byte_ranges);
+    paint_text_column_overlay(
+        ui,
+        rect,
+        pane_kind,
+        text_char_width,
+        highlighted_byte_ranges,
+    );
     ui.painter().text(
         egui::pos2(rect.left() + TEXT_CELL_PADDING_X, rect.center().y),
         egui::Align2::LEFT_CENTER,
         text,
-        FontId::new(13.0, FontFamily::Monospace),
+        text_pane_font_id(),
         color,
     );
 }
@@ -3112,13 +3140,14 @@ fn paint_text_column_overlay(
     ui: &mut Ui,
     rect: Rect,
     pane_kind: TextPaneKind,
+    text_char_width: f32,
     highlighted_byte_ranges: &[(usize, usize)],
 ) {
     if highlighted_byte_ranges.is_empty() {
         return;
     }
 
-    let x_step = text_pane_column_step(pane_kind);
+    let x_step = text_pane_column_step(pane_kind, text_char_width);
     for (start_col, end_col) in highlighted_byte_ranges.iter().copied() {
         let highlight_rect = Rect::from_min_max(
             egui::pos2(
@@ -3138,10 +3167,29 @@ fn paint_text_column_overlay(
     }
 }
 
-fn text_pane_column_step(pane_kind: TextPaneKind) -> f32 {
+fn text_pane_font_id() -> FontId {
+    FontId::new(TEXT_FONT_SIZE, FontFamily::Monospace)
+}
+
+fn text_pane_char_width(ui: &Ui) -> f32 {
+    let font_id = text_pane_font_id();
+    ui.fonts_mut(|fonts| fonts.glyph_width(&font_id, '0'))
+        .max(1.0)
+}
+
+fn text_pane_content_width(
+    bytes_per_row: usize,
+    pane_kind: TextPaneKind,
+    text_char_width: f32,
+) -> f32 {
+    text_pane_column_step(pane_kind, text_char_width) * bytes_per_row as f32
+        + TEXT_CELL_PADDING_X * 2.0
+}
+
+fn text_pane_column_step(pane_kind: TextPaneKind, text_char_width: f32) -> f32 {
     match pane_kind {
-        TextPaneKind::Hex => ASCII_COLUMN_CHAR_WIDTH * 3.0,
-        TextPaneKind::Ascii => ASCII_COLUMN_CHAR_WIDTH,
+        TextPaneKind::Hex => text_char_width * 3.0,
+        TextPaneKind::Ascii => text_char_width,
     }
 }
 
@@ -3188,6 +3236,7 @@ mod tests {
     #[test]
     fn text_pointer_maps_to_byte_columns() {
         let rect = Rect::from_min_max(pos2(10.0, 20.0), pos2(210.0, 220.0));
+        let text_char_width = 8.0;
 
         assert_eq!(
             pointer_byte_col_in_text_pane(
@@ -3195,12 +3244,20 @@ mod tests {
                 0.0,
                 16,
                 TextPaneKind::Ascii,
+                text_char_width,
                 Some(pos2(19.0, 40.0))
             ),
             Some(0)
         );
         assert_eq!(
-            pointer_byte_col_in_text_pane(rect, 0.0, 16, TextPaneKind::Hex, Some(pos2(45.0, 40.0))),
+            pointer_byte_col_in_text_pane(
+                rect,
+                0.0,
+                16,
+                TextPaneKind::Hex,
+                text_char_width,
+                Some(pos2(45.0, 40.0))
+            ),
             Some(1)
         );
         assert_eq!(
@@ -3209,6 +3266,7 @@ mod tests {
                 999.0,
                 16,
                 TextPaneKind::Ascii,
+                text_char_width,
                 Some(pos2(209.0, 40.0))
             ),
             Some(15)
