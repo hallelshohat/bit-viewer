@@ -53,8 +53,16 @@ impl DerivedGroup {
         self.data.len_bits()
     }
 
+    pub fn len_bytes_rounded_up(&self) -> usize {
+        self.data.len_bytes_rounded_up()
+    }
+
     pub fn bit(&self, index: usize) -> Option<u8> {
         self.data.bit(index)
+    }
+
+    pub fn packed_bytes(&self) -> &[u8] {
+        self.data.bytes()
     }
 }
 
@@ -102,6 +110,15 @@ impl DerivedView {
     pub fn group_prefix_bits(&self) -> &[usize] {
         &self.group_prefix_bits
     }
+
+    pub fn flattened_packed_bytes(&self) -> Vec<u8> {
+        let buffers = self
+            .groups
+            .iter()
+            .map(|group| group.data.clone())
+            .collect::<Vec<_>>();
+        BitBuffer::concatenate(&buffers).into_bytes()
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -120,8 +137,20 @@ impl BitBuffer {
         self.bit_len
     }
 
+    fn len_bytes_rounded_up(&self) -> usize {
+        self.bit_len.div_ceil(8)
+    }
+
     fn is_empty(&self) -> bool {
         self.bit_len == 0
+    }
+
+    fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        self.bytes
     }
 
     fn bit(&self, index: usize) -> Option<u8> {

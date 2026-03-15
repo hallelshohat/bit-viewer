@@ -13,6 +13,10 @@ use egui::containers::menu::{MenuButton, MenuConfig};
 use rfd::FileDialog;
 
 use crate::document::BinaryDocument;
+use crate::export::{
+    ExportFormat, LinkTypeOption, PcapExportOptions, WAV_CODEC_PRESETS, WavExportOptions,
+    default_export_file_name, export_flattened_bits, export_pcap, export_wav, known_link_types,
+};
 use crate::filters::{DerivedView, FilterPipeline, FilterStep, build_derived_view};
 use crate::viewer::{
     BIT_VALUE_NO_DATA, RowData, RowLayout, bit_offset_to_row, build_bit_window, build_row,
@@ -20,7 +24,7 @@ use crate::viewer::{
 };
 
 const DEFAULT_ROW_WIDTH_BITS: usize = 128;
-const MIN_ROW_WIDTH_BITS: usize = 8;
+const MIN_ROW_WIDTH_BITS: usize = 1;
 const MAX_ROW_WIDTH_BITS: usize = usize::MAX;
 const DEFAULT_BIT_SIZE: f32 = 7.0;
 const MIN_BIT_SIZE: f32 = 2.0;
@@ -42,12 +46,16 @@ const APP_BG: Color32 = Color32::from_rgb(8, 14, 24);
 const SURFACE_BG: Color32 = Color32::from_rgb(22, 31, 46);
 const SURFACE_ALT_BG: Color32 = Color32::from_rgb(29, 40, 59);
 const SURFACE_SUBTLE_BG: Color32 = Color32::from_rgb(36, 49, 71);
+const TOP_BAR_MENU_BG: Color32 = Color32::from_rgb(24, 39, 66);
+const TOP_BAR_MENU_ALT_BG: Color32 = Color32::from_rgb(31, 50, 84);
 const BORDER_COLOR: Color32 = Color32::from_rgb(72, 92, 126);
 const ACCENT_COLOR: Color32 = Color32::from_rgb(118, 203, 255);
 const ACCENT_SOFT: Color32 = Color32::from_rgb(44, 96, 148);
 const TEXT_PRIMARY: Color32 = Color32::from_rgb(245, 248, 255);
 const TEXT_MUTED: Color32 = Color32::from_rgb(182, 194, 217);
 const ERROR_COLOR: Color32 = Color32::from_rgb(255, 119, 119);
+const SUCCESS_BG: Color32 = Color32::from_rgb(19, 54, 42);
+const SUCCESS_BORDER: Color32 = Color32::from_rgb(54, 122, 96);
 const HEX_COLUMN_MIN_WIDTH: f32 = 260.0;
 const ASCII_COLUMN_MIN_WIDTH: f32 = 150.0;
 const ASCII_COLUMN_DEFAULT_WIDTH: f32 = 180.0;
@@ -59,10 +67,36 @@ const BIT_PANEL_DEFAULT_MAX_WIDTH: f32 = 760.0;
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const TEXT_CELL_PADDING_X: f32 = 10.0;
 const VIEWER_PANEL_GAP: f32 = 14.0;
+const WAV_SAMPLE_RATE_PRESETS: [u32; 14] = [
+    8_000, 11_025, 12_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000, 88_200, 96_000, 176_400,
+    192_000, 384_000,
+];
+const MAX_WAV_CHANNELS: u16 = 16;
 
 struct DerivedBuildResult {
     request_id: u64,
     result: Result<DerivedView, String>,
+}
+
+struct ExportSaveDialogResult {
+    request_id: u64,
+    path: Option<PathBuf>,
+}
+
+#[derive(Clone)]
+struct PendingExportRequest {
+    request_id: u64,
+    format: ExportFormat,
+    view: DerivedView,
+    pcap: PcapExportOptions,
+    wav: WavExportOptions,
+}
+
+struct ExportWorkerResult {
+    request_id: u64,
+    format: ExportFormat,
+    path: PathBuf,
+    result: Result<(), String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,7 +181,23 @@ pub struct BitViewerApp {
     rebuild_rx: Option<Receiver<DerivedBuildResult>>,
     rebuild_pending: bool,
     rebuild_request_id: u64,
+    show_export_window: bool,
+    export_format: ExportFormat,
+    link_type_options: Vec<LinkTypeOption>,
+    selected_link_type: u32,
+    pcap_link_search: String,
+    pcap_use_custom_link_type: bool,
+    pcap_custom_link_type: u32,
+    pcap_timestamp_step_micros: u32,
+    wav_options: WavExportOptions,
+    export_save_dialog_rx: Option<Receiver<ExportSaveDialogResult>>,
+    export_save_dialog_pending: bool,
+    pending_export_request: Option<PendingExportRequest>,
+    export_rx: Option<Receiver<ExportWorkerResult>>,
+    export_pending: bool,
+    export_request_id: u64,
     show_shortcuts: bool,
+    last_export_message: Option<String>,
     last_error: Option<String>,
 }
 
@@ -182,7 +232,23 @@ impl Default for BitViewerApp {
             rebuild_rx: None,
             rebuild_pending: false,
             rebuild_request_id: 0,
+            show_export_window: false,
+            export_format: ExportFormat::FlattenedBits,
+            link_type_options: known_link_types(),
+            selected_link_type: 1,
+            pcap_link_search: String::new(),
+            pcap_use_custom_link_type: false,
+            pcap_custom_link_type: 1,
+            pcap_timestamp_step_micros: 1,
+            wav_options: WavExportOptions::default(),
+            export_save_dialog_rx: None,
+            export_save_dialog_pending: false,
+            pending_export_request: None,
+            export_rx: None,
+            export_pending: false,
+            export_request_id: 0,
             show_shortcuts: false,
+            last_export_message: None,
             last_error: None,
         }
     }
@@ -296,12 +362,18 @@ impl eframe::App for BitViewerApp {
     fn update(&mut self, context: &Context, _frame: &mut eframe::Frame) {
         self.poll_file_dialog();
         self.poll_rebuild();
+        self.poll_export_save_dialog();
+        self.poll_export();
         self.handle_file_drop(context);
         self.finish_active_draw_stroke_on_release(context);
         self.handle_keyboard_shortcuts(context);
         self.advance_view_settings(context);
 
-        if self.file_dialog_pending || self.rebuild_pending {
+        if self.file_dialog_pending
+            || self.rebuild_pending
+            || self.export_save_dialog_pending
+            || self.export_pending
+        {
             context.request_repaint_after(POLL_INTERVAL);
         }
 
@@ -342,6 +414,7 @@ impl eframe::App for BitViewerApp {
             });
 
         self.show_shortcuts_window(context);
+        self.show_export_window(context);
     }
 }
 
@@ -651,74 +724,140 @@ impl BitViewerApp {
     }
 
     fn show_top_bar(&mut self, ui: &mut Ui) {
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .add_sized([76.0, 34.0], egui::Button::new("Open"))
-                .clicked()
-            {
-                self.start_file_dialog();
-            }
+        ui.horizontal(|ui| {
+            ui.scope(|ui| {
+                ui.spacing_mut().button_padding = egui::vec2(14.0, 9.0);
+                ui.spacing_mut().interact_size = egui::vec2(44.0, 34.0);
 
-            ui.menu_button("Source", |ui| {
-                self.show_source_menu(ui);
+                let visuals = &mut ui.style_mut().visuals;
+                visuals.override_text_color = Some(TEXT_PRIMARY);
+                visuals.panel_fill = TOP_BAR_MENU_BG;
+                visuals.window_fill = TOP_BAR_MENU_BG;
+                visuals.faint_bg_color = TOP_BAR_MENU_ALT_BG;
+                visuals.extreme_bg_color = TOP_BAR_MENU_ALT_BG;
+                visuals.widgets.noninteractive.bg_fill = TOP_BAR_MENU_BG;
+                visuals.widgets.noninteractive.weak_bg_fill = TOP_BAR_MENU_BG;
+                visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER_COLOR);
+                visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+                visuals.widgets.inactive.bg_fill = Color32::from_rgb(28, 42, 66);
+                visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(28, 42, 66);
+                visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, ACCENT_SOFT);
+                visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+                visuals.widgets.hovered.bg_fill = Color32::from_rgb(36, 56, 88);
+                visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(36, 56, 88);
+                visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, ACCENT_COLOR);
+                visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+                visuals.widgets.active.bg_fill = Color32::from_rgb(42, 66, 103);
+                visuals.widgets.active.weak_bg_fill = Color32::from_rgb(42, 66, 103);
+                visuals.widgets.active.bg_stroke = Stroke::new(1.0, ACCENT_COLOR);
+                visuals.widgets.active.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+                visuals.widgets.open.bg_fill = Color32::from_rgb(36, 56, 88);
+                visuals.widgets.open.weak_bg_fill = Color32::from_rgb(36, 56, 88);
+                visuals.widgets.open.bg_stroke = Stroke::new(1.0, ACCENT_COLOR);
+                visuals.widgets.open.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+
+                if ui
+                    .add_sized([76.0, 34.0], egui::Button::new("Open"))
+                    .clicked()
+                {
+                    self.start_file_dialog();
+                }
+
+                MenuButton::new("Source")
+                    .config(self.top_bar_menu_config())
+                    .ui(ui, |ui| {
+                        self.show_source_menu(ui);
+                    });
+                MenuButton::new("Navigate")
+                    .config(self.top_bar_menu_config())
+                    .ui(ui, |ui| {
+                        self.show_navigation_menu(ui);
+                    });
+                MenuButton::new("View")
+                    .config(self.top_bar_menu_config())
+                    .ui(ui, |ui| {
+                        self.show_view_menu(ui);
+                    });
+                if ui
+                    .add_sized([84.0, 34.0], egui::Button::new("Export"))
+                    .clicked()
+                {
+                    self.show_export_window = true;
+                }
+
+                let filter_label = if self.pipeline.is_empty() {
+                    "Filters".to_owned()
+                } else {
+                    format!("Filters ({})", self.pipeline.steps.len())
+                };
+                MenuButton::new(filter_label)
+                    .config(self.top_bar_menu_config())
+                    .ui(ui, |ui| {
+                        ui.set_min_width(420.0);
+                        ScrollArea::vertical()
+                            .id_salt("filters-menu-scroll")
+                            .max_height(520.0)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                if self.show_filter_editor(ui) {
+                                    self.schedule_rebuild();
+                                }
+                            });
+                    });
+
+                MenuButton::new("Help")
+                    .config(self.top_bar_menu_config())
+                    .ui(ui, |ui| {
+                        self.show_help_menu(ui);
+                    });
             });
-            ui.menu_button("Navigate", |ui| {
-                self.show_navigation_menu(ui);
-            });
-            ui.menu_button("View", |ui| {
-                self.show_view_menu(ui);
-            });
-
-            let filter_label = if self.pipeline.is_empty() {
-                "Filters".to_owned()
-            } else {
-                format!("Filters ({})", self.pipeline.steps.len())
-            };
-            MenuButton::new(filter_label)
-                .config(
-                    MenuConfig::new().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
-                )
-                .ui(ui, |ui| {
-                    ui.set_min_width(420.0);
-                    ScrollArea::vertical()
-                        .id_salt("filters-menu-scroll")
-                        .max_height(520.0)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            if self.show_filter_editor(ui) {
-                                self.schedule_rebuild();
-                            }
-                        });
-                });
-
-            ui.menu_button("Help", |ui| {
-                self.show_help_menu(ui);
-            });
-
-            if self.file_dialog_pending {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(RichText::new("opening chooser").small().color(TEXT_MUTED));
-                });
-            }
-
-            if self.rebuild_pending {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(RichText::new("rebuilding view").small().color(TEXT_MUTED));
-                });
-            }
-
-            if let Some(document) = &self.document {
-                ui.separator();
-                ui.label(
-                    RichText::new(document.file_name())
-                        .small()
-                        .strong()
-                        .color(TEXT_PRIMARY),
-                );
-            }
         });
+
+        if self.file_dialog_pending
+            || self.rebuild_pending
+            || self.export_save_dialog_pending
+            || self.export_pending
+            || self.document.is_some()
+        {
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                if self.file_dialog_pending {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(RichText::new("opening chooser").small().color(TEXT_MUTED));
+                    });
+                }
+
+                if self.rebuild_pending {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(RichText::new("rebuilding view").small().color(TEXT_MUTED));
+                    });
+                }
+
+                if self.export_save_dialog_pending {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            RichText::new("choosing export destination")
+                                .small()
+                                .color(TEXT_MUTED),
+                        );
+                    });
+                }
+
+                if self.export_pending {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(RichText::new("writing export").small().color(TEXT_MUTED));
+                    });
+                }
+
+                if let Some(document) = &self.document {
+                    self.status_chip(ui, document.file_name());
+                }
+            });
+        }
 
         if let Some(error) = &self.last_error {
             ui.add_space(8.0);
@@ -731,9 +870,22 @@ impl BitViewerApp {
                     ui.colored_label(ERROR_COLOR, error);
                 });
         }
+
+        if let Some(message) = &self.last_export_message {
+            ui.add_space(8.0);
+            egui::Frame::new()
+                .fill(SUCCESS_BG)
+                .stroke(Stroke::new(1.0, SUCCESS_BORDER))
+                .corner_radius(CornerRadius::same(12))
+                .inner_margin(egui::Margin::symmetric(10, 8))
+                .show(ui, |ui| {
+                    ui.label(RichText::new(message).color(TEXT_PRIMARY));
+                });
+        }
     }
 
     fn show_source_menu(&mut self, ui: &mut Ui) {
+        self.apply_top_bar_menu_visuals(ui);
         ui.set_min_width(340.0);
         self.section_header(ui, "Source", "Open a file or paste a path.");
 
@@ -776,6 +928,7 @@ impl BitViewerApp {
     }
 
     fn show_navigation_menu(&mut self, ui: &mut Ui) {
+        self.apply_top_bar_menu_visuals(ui);
         ui.set_min_width(300.0);
         self.section_header(ui, "Navigation", "Jump directly to byte or bit offsets.");
 
@@ -813,6 +966,7 @@ impl BitViewerApp {
     }
 
     fn show_view_menu(&mut self, ui: &mut Ui) {
+        self.apply_top_bar_menu_visuals(ui);
         ui.set_min_width(320.0);
         self.section_header(
             ui,
@@ -872,6 +1026,7 @@ impl BitViewerApp {
     }
 
     fn show_help_menu(&mut self, ui: &mut Ui) {
+        self.apply_top_bar_menu_visuals(ui);
         ui.set_min_width(260.0);
         self.section_header(
             ui,
@@ -927,6 +1082,7 @@ impl BitViewerApp {
     }
 
     fn show_filter_editor(&mut self, ui: &mut Ui) -> bool {
+        self.apply_top_bar_menu_visuals(ui);
         let visuals = &mut ui.style_mut().visuals;
         visuals.override_text_color = Some(TEXT_PRIMARY);
         visuals.widgets.inactive.bg_fill = SURFACE_SUBTLE_BG;
@@ -1305,6 +1461,387 @@ impl BitViewerApp {
         self.show_shortcuts = show_shortcuts;
     }
 
+    fn show_export_window(&mut self, context: &Context) {
+        if !self.show_export_window {
+            return;
+        }
+
+        let mut show_export_window = self.show_export_window;
+        egui::Window::new("Export")
+            .open(&mut show_export_window)
+            .default_width(720.0)
+            .min_width(620.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(SURFACE_BG)
+                    .stroke(Stroke::new(1.0, BORDER_COLOR))
+                    .corner_radius(CornerRadius::same(20))
+                    .inner_margin(egui::Margin::symmetric(18, 16)),
+            )
+            .show(context, |ui| {
+                self.section_header(
+                    ui,
+                    "Export View",
+                    "Write the current derived view as raw bits, a packet capture, or a WAV container.",
+                );
+
+                if let Some(view) = &self.derived_view {
+                    ui.horizontal_wrapped(|ui| {
+                        self.status_chip(ui, &format!("{} groups", view.group_count()));
+                        self.status_chip(ui, &format!("{} bits", view.total_bits()));
+                        self.status_chip(
+                            ui,
+                            &format!("{} rounded bytes", view.total_bytes_rounded_up()),
+                        );
+                    });
+
+                    if view.total_bits() % 8 != 0 {
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new(
+                                "The derived view ends on a partial byte. Export pads the tail with zero bits.",
+                            )
+                            .small()
+                            .color(TEXT_MUTED),
+                        );
+                    }
+                } else if self.rebuild_pending {
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(
+                            "Wait for the filtered view to finish building before exporting.",
+                        )
+                        .color(TEXT_MUTED),
+                    );
+                } else {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Load a file before exporting.").color(TEXT_MUTED));
+                }
+
+                ui.add_space(10.0);
+                egui::Grid::new("export-settings-grid")
+                    .num_columns(2)
+                    .spacing(egui::vec2(14.0, 10.0))
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("Format").color(TEXT_MUTED));
+                        egui::ComboBox::from_id_salt("export-format")
+                            .selected_text(self.export_format_label())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.export_format,
+                                    ExportFormat::FlattenedBits,
+                                    "Flattened bit file",
+                                );
+                                ui.selectable_value(
+                                    &mut self.export_format,
+                                    ExportFormat::Pcap,
+                                    "PCAP packet capture",
+                                );
+                                ui.selectable_value(
+                                    &mut self.export_format,
+                                    ExportFormat::Wav,
+                                    "WAV audio file",
+                                );
+                            });
+                        ui.end_row();
+                    });
+
+                ui.add_space(12.0);
+                match self.export_format {
+                    ExportFormat::FlattenedBits => self.show_flattened_export_ui(ui),
+                    ExportFormat::Pcap => self.show_pcap_export_ui(ui),
+                    ExportFormat::Wav => self.show_wav_export_ui(ui),
+                }
+
+                ui.add_space(14.0);
+                if ui
+                    .add_enabled(
+                        !self.export_save_dialog_pending && !self.export_pending,
+                        egui::Button::new("Choose destination and export")
+                            .min_size(egui::vec2(240.0, 38.0)),
+                    )
+                    .clicked()
+                {
+                    self.start_export_flow();
+                }
+
+                if self.export_save_dialog_pending || self.export_pending {
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        let status = if self.export_pending {
+                            "Writing export..."
+                        } else {
+                            "Waiting for destination..."
+                        };
+                        ui.label(RichText::new(status).color(TEXT_MUTED));
+                    });
+                }
+            });
+
+        self.show_export_window = show_export_window;
+    }
+
+    fn show_flattened_export_ui(&self, ui: &mut Ui) {
+        self.compact_card_frame(SURFACE_ALT_BG).show(ui, |ui| {
+            self.section_header(
+                ui,
+                "Flattened Bit File",
+                "Concatenate all visible groups and write the packed bitstream as raw bytes.",
+            );
+            ui.label(
+                RichText::new(
+                    "The output uses the same MSB-first bit packing as the viewer and zero-pads the final byte when needed.",
+                )
+                .small()
+                .color(TEXT_MUTED),
+            );
+        });
+    }
+
+    fn show_pcap_export_ui(&mut self, ui: &mut Ui) {
+        self.compact_card_frame(SURFACE_ALT_BG).show(ui, |ui| {
+            self.section_header(
+                ui,
+                "PCAP",
+                "Export each visible group as a packet. Search the full known link-layer catalog or switch to a custom numeric type.",
+            );
+
+            ui.checkbox(
+                &mut self.pcap_use_custom_link_type,
+                "Use a custom numeric link-layer type",
+            );
+            ui.add_space(6.0);
+
+            if self.pcap_use_custom_link_type {
+                ui.scope(|ui| {
+                    let visuals = &mut ui.style_mut().visuals;
+                    visuals.override_text_color = Some(TEXT_PRIMARY);
+                    visuals.widgets.inactive.bg_fill = SURFACE_SUBTLE_BG;
+                    visuals.widgets.inactive.weak_bg_fill = SURFACE_SUBTLE_BG;
+                    visuals.widgets.hovered.bg_fill = Color32::from_rgb(37, 50, 76);
+                    visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(37, 50, 76);
+                    visuals.widgets.active.bg_fill = Color32::from_rgb(43, 59, 88);
+                    visuals.widgets.active.weak_bg_fill = Color32::from_rgb(43, 59, 88);
+
+                    egui::Grid::new("pcap-custom-linktype-grid")
+                        .num_columns(2)
+                        .spacing(egui::vec2(12.0, 8.0))
+                        .show(ui, |ui| {
+                            ui.label(RichText::new("Link type id").color(TEXT_MUTED));
+                            ui.add(
+                                egui::DragValue::new(&mut self.pcap_custom_link_type)
+                                    .range(0..=u32::MAX)
+                                    .speed(1),
+                            );
+                            ui.end_row();
+                        });
+                });
+            } else {
+                ui.label(RichText::new("Search link-layer type").color(TEXT_MUTED));
+                ui.scope(|ui| {
+                    let visuals = &mut ui.style_mut().visuals;
+                    visuals.override_text_color = Some(TEXT_PRIMARY);
+                    visuals.widgets.inactive.bg_fill = SURFACE_SUBTLE_BG;
+                    visuals.widgets.inactive.weak_bg_fill = SURFACE_SUBTLE_BG;
+                    visuals.widgets.hovered.bg_fill = Color32::from_rgb(37, 50, 76);
+                    visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(37, 50, 76);
+                    visuals.widgets.active.bg_fill = Color32::from_rgb(43, 59, 88);
+                    visuals.widgets.active.weak_bg_fill = Color32::from_rgb(43, 59, 88);
+
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.pcap_link_search).hint_text(
+                            "Search by numeric id or name, for example 105 or IEEE802_11",
+                        ),
+                    );
+                });
+                ui.add_space(8.0);
+
+                let query = self.pcap_link_search.trim().to_ascii_lowercase();
+                let mut matches = 0usize;
+                ui.scope(|ui| {
+                    let visuals = &mut ui.style_mut().visuals;
+                    visuals.override_text_color = Some(TEXT_PRIMARY);
+                    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+                    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+                    visuals.widgets.active.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+
+                    ScrollArea::vertical()
+                        .id_salt("pcap-linktype-search-results")
+                        .max_height(240.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for option in self.link_type_options.iter().filter(|option| {
+                                query.is_empty()
+                                    || option.id.to_string().contains(&query)
+                                    || option.label.to_ascii_lowercase().contains(&query)
+                            }) {
+                                matches += 1;
+                                let is_selected = self.selected_link_type == option.id;
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new(format!(
+                                                "{:>3}  {}",
+                                                option.id, option.label
+                                            ))
+                                            .color(TEXT_PRIMARY)
+                                            .monospace(),
+                                        )
+                                        .selected(is_selected)
+                                        .fill(if is_selected {
+                                            Color32::from_rgb(45, 68, 102)
+                                        } else {
+                                            SURFACE_SUBTLE_BG
+                                        })
+                                        .stroke(Stroke::new(
+                                            1.0,
+                                            if is_selected {
+                                                ACCENT_COLOR
+                                            } else {
+                                                BORDER_COLOR
+                                            },
+                                        )),
+                                    )
+                                    .clicked()
+                                {
+                                    self.selected_link_type = option.id;
+                                }
+                            }
+                        });
+                });
+
+                if matches == 0 {
+                    ui.label(
+                        RichText::new("No link-layer types matched the current search.")
+                            .small()
+                            .color(TEXT_MUTED),
+                    );
+                } else {
+                    ui.label(
+                        RichText::new(format!("{matches} known link-layer types matched."))
+                            .small()
+                            .color(TEXT_MUTED),
+                    );
+                }
+            }
+
+            ui.add_space(8.0);
+            ui.scope(|ui| {
+                let visuals = &mut ui.style_mut().visuals;
+                visuals.override_text_color = Some(TEXT_PRIMARY);
+                visuals.widgets.inactive.bg_fill = SURFACE_SUBTLE_BG;
+                visuals.widgets.inactive.weak_bg_fill = SURFACE_SUBTLE_BG;
+                visuals.widgets.hovered.bg_fill = Color32::from_rgb(37, 50, 76);
+                visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(37, 50, 76);
+                visuals.widgets.active.bg_fill = Color32::from_rgb(43, 59, 88);
+                visuals.widgets.active.weak_bg_fill = Color32::from_rgb(43, 59, 88);
+
+                egui::Grid::new("pcap-export-grid")
+                    .num_columns(2)
+                    .spacing(egui::vec2(12.0, 8.0))
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("Timestamp step").color(TEXT_MUTED));
+                        ui.add(
+                            egui::DragValue::new(&mut self.pcap_timestamp_step_micros)
+                                .range(1..=u32::MAX)
+                                .speed(1)
+                                .suffix(" us"),
+                        );
+                        ui.end_row();
+                    });
+            });
+        });
+    }
+
+    fn show_wav_export_ui(&mut self, ui: &mut Ui) {
+        self.compact_card_frame(SURFACE_ALT_BG).show(ui, |ui| {
+            self.section_header(
+                ui,
+                "WAV",
+                "Wrap the flattened byte stream in RIFF/WAVE using PCM, IEEE float, A-LAW, or mu-LAW format tags.",
+            );
+
+            egui::Grid::new("wav-export-grid")
+                .num_columns(2)
+                .spacing(egui::vec2(12.0, 10.0))
+                .show(ui, |ui| {
+                    ui.label(RichText::new("Codec preset").color(TEXT_MUTED));
+                    egui::ComboBox::from_id_salt("wav-codec")
+                        .selected_text(self.wav_options.codec.label())
+                        .show_ui(ui, |ui| {
+                            for codec in WAV_CODEC_PRESETS {
+                                ui.selectable_value(
+                                    &mut self.wav_options.codec,
+                                    codec,
+                                    codec.label(),
+                                );
+                            }
+                        });
+                    ui.end_row();
+
+                    ui.label(RichText::new("Sample rate").color(TEXT_MUTED));
+                    ui.horizontal_wrapped(|ui| {
+                        egui::ComboBox::from_id_salt("wav-sample-rate")
+                            .selected_text(self.wav_options.sample_rate.to_string())
+                            .show_ui(ui, |ui| {
+                                for sample_rate in WAV_SAMPLE_RATE_PRESETS {
+                                    ui.selectable_value(
+                                        &mut self.wav_options.sample_rate,
+                                        sample_rate,
+                                        sample_rate.to_string(),
+                                    );
+                                }
+                            });
+                        ui.add(
+                            egui::DragValue::new(&mut self.wav_options.sample_rate)
+                                .range(1..=u32::MAX)
+                                .speed(100),
+                        );
+                    });
+                    ui.end_row();
+
+                    ui.label(RichText::new("Channels").color(TEXT_MUTED));
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("wav-channels")
+                            .selected_text(self.wav_options.channels.to_string())
+                            .show_ui(ui, |ui| {
+                                for channels in 1..=MAX_WAV_CHANNELS {
+                                    ui.selectable_value(
+                                        &mut self.wav_options.channels,
+                                        channels,
+                                        channels.to_string(),
+                                    );
+                                }
+                            });
+                        ui.add(
+                            egui::DragValue::new(&mut self.wav_options.channels)
+                                .range(1..=MAX_WAV_CHANNELS)
+                                .speed(1),
+                        );
+                    });
+                    ui.end_row();
+                });
+
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(
+                    "The flattened byte stream becomes interleaved sample frames. Multi-byte codecs require the payload length to align to the chosen frame size.",
+                )
+                .small()
+                .color(TEXT_MUTED),
+            );
+        });
+    }
+
+    fn export_format_label(&self) -> &'static str {
+        match self.export_format {
+            ExportFormat::FlattenedBits => "Flattened bit file",
+            ExportFormat::Pcap => "PCAP packet capture",
+            ExportFormat::Wav => "WAV audio file",
+        }
+    }
+
     fn card_frame(&self, fill: Color32) -> egui::Frame {
         egui::Frame::new()
             .fill(fill)
@@ -1319,6 +1856,35 @@ impl BitViewerApp {
             .stroke(Stroke::new(1.0, BORDER_COLOR))
             .corner_radius(CornerRadius::same(14))
             .inner_margin(egui::Margin::symmetric(12, 10))
+    }
+
+    fn apply_top_bar_menu_visuals(&self, ui: &mut Ui) {
+        let visuals = &mut ui.style_mut().visuals;
+        visuals.override_text_color = Some(TEXT_PRIMARY);
+        visuals.panel_fill = TOP_BAR_MENU_BG;
+        visuals.window_fill = TOP_BAR_MENU_BG;
+        visuals.faint_bg_color = TOP_BAR_MENU_ALT_BG;
+        visuals.extreme_bg_color = TOP_BAR_MENU_ALT_BG;
+        visuals.widgets.inactive.bg_fill = TOP_BAR_MENU_ALT_BG;
+        visuals.widgets.inactive.weak_bg_fill = TOP_BAR_MENU_ALT_BG;
+        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER_COLOR);
+        visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+        visuals.widgets.hovered.bg_fill = Color32::from_rgb(42, 66, 103);
+        visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(42, 66, 103);
+        visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, ACCENT_COLOR);
+        visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+        visuals.widgets.active.bg_fill = Color32::from_rgb(48, 74, 115);
+        visuals.widgets.active.weak_bg_fill = Color32::from_rgb(48, 74, 115);
+        visuals.widgets.active.bg_stroke = Stroke::new(1.0, ACCENT_COLOR);
+        visuals.widgets.active.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+        visuals.widgets.open.bg_fill = Color32::from_rgb(42, 66, 103);
+        visuals.widgets.open.weak_bg_fill = Color32::from_rgb(42, 66, 103);
+        visuals.widgets.open.bg_stroke = Stroke::new(1.0, ACCENT_COLOR);
+        visuals.widgets.open.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+    }
+
+    fn top_bar_menu_config(&self) -> MenuConfig {
+        MenuConfig::new().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
     }
 
     fn section_header(&self, ui: &mut Ui, title: &str, subtitle: &str) {
@@ -1921,6 +2487,168 @@ impl BitViewerApp {
         }
     }
 
+    fn start_export_flow(&mut self) {
+        if self.export_save_dialog_pending || self.export_pending {
+            return;
+        }
+
+        let Some(request) = self.build_pending_export_request() else {
+            return;
+        };
+        let Some(document) = &self.document else {
+            self.last_error = Some("Load a file before exporting.".to_owned());
+            return;
+        };
+
+        let suggested_name = default_export_file_name(document.file_name(), request.format);
+        let format = request.format;
+        let request_id = request.request_id;
+        let (sender, receiver) = mpsc::channel();
+
+        self.export_save_dialog_rx = Some(receiver);
+        self.export_save_dialog_pending = true;
+        self.pending_export_request = Some(request);
+        self.last_error = None;
+        self.last_export_message = None;
+
+        thread::spawn(move || {
+            let dialog = FileDialog::new()
+                .set_file_name(&suggested_name)
+                .add_filter(format.filter_label(), &[format.default_extension()]);
+            let path = dialog.save_file();
+            let _ = sender.send(ExportSaveDialogResult { request_id, path });
+        });
+    }
+
+    fn build_pending_export_request(&mut self) -> Option<PendingExportRequest> {
+        if self.rebuild_pending {
+            self.last_error = Some("Wait for the filtered view to finish building.".to_owned());
+            return None;
+        }
+
+        let Some(view) = self.derived_view.clone() else {
+            self.last_error = Some("There is no derived view to export.".to_owned());
+            return None;
+        };
+
+        let pcap_link_type = if self.pcap_use_custom_link_type {
+            self.pcap_custom_link_type
+        } else {
+            self.selected_link_type
+        };
+        let pcap = PcapExportOptions {
+            link_type: pcap_link_type,
+            timestamp_step_micros: self.pcap_timestamp_step_micros.max(1),
+        };
+        let wav = self.wav_options.clone();
+        let request_id = self.export_request_id.saturating_add(1);
+        self.export_request_id = request_id;
+
+        Some(PendingExportRequest {
+            request_id,
+            format: self.export_format,
+            view,
+            pcap,
+            wav,
+        })
+    }
+
+    fn poll_export_save_dialog(&mut self) {
+        let Some(receiver) = &self.export_save_dialog_rx else {
+            return;
+        };
+
+        match receiver.try_recv() {
+            Ok(result) => {
+                self.export_save_dialog_rx = None;
+                self.export_save_dialog_pending = false;
+
+                let Some(request) = self.pending_export_request.take() else {
+                    return;
+                };
+
+                if result.request_id != request.request_id {
+                    return;
+                }
+
+                if let Some(path) = result.path {
+                    self.start_export_worker(request, path);
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.export_save_dialog_rx = None;
+                self.export_save_dialog_pending = false;
+                self.pending_export_request = None;
+                self.last_error =
+                    Some("Export destination chooser failed before returning a path.".to_owned());
+            }
+        }
+    }
+
+    fn start_export_worker(&mut self, request: PendingExportRequest, path: PathBuf) {
+        let (sender, receiver) = mpsc::channel();
+        let request_id = request.request_id;
+
+        self.export_rx = Some(receiver);
+        self.export_pending = true;
+        self.last_error = None;
+        self.last_export_message = None;
+
+        thread::spawn(move || {
+            let result = match request.format {
+                ExportFormat::FlattenedBits => export_flattened_bits(&request.view, &path),
+                ExportFormat::Pcap => export_pcap(&request.view, &path, &request.pcap),
+                ExportFormat::Wav => export_wav(&request.view, &path, &request.wav),
+            };
+
+            let _ = sender.send(ExportWorkerResult {
+                request_id,
+                format: request.format,
+                path,
+                result,
+            });
+        });
+    }
+
+    fn poll_export(&mut self) {
+        let Some(receiver) = &self.export_rx else {
+            return;
+        };
+
+        match receiver.try_recv() {
+            Ok(result) => {
+                if result.request_id != self.export_request_id {
+                    return;
+                }
+
+                self.export_rx = None;
+                self.export_pending = false;
+                match result.result {
+                    Ok(()) => {
+                        self.last_error = None;
+                        self.last_export_message = Some(format!(
+                            "{} written to {}",
+                            result.format.success_label(),
+                            result.path.display()
+                        ));
+                    }
+                    Err(error) => {
+                        self.last_export_message = None;
+                        self.last_error = Some(error);
+                    }
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.export_rx = None;
+                self.export_pending = false;
+                self.last_export_message = None;
+                self.last_error = Some("Export worker stopped unexpectedly.".to_owned());
+            }
+        }
+    }
+
     fn poll_rebuild(&mut self) {
         let Some(receiver) = &self.rebuild_rx else {
             return;
@@ -1979,6 +2707,7 @@ impl BitViewerApp {
         self.current_bit_scroll_row = 0;
         self.current_text_scroll_row = 0;
         self.last_error = None;
+        self.last_export_message = None;
 
         thread::spawn(move || {
             let result = BinaryDocument::open(&path)
@@ -2484,5 +3213,17 @@ mod tests {
             ),
             Some(15)
         );
+    }
+
+    #[test]
+    fn row_width_input_accepts_one_bit() {
+        let mut app = BitViewerApp::default();
+        app.row_width_input = "1".to_owned();
+
+        app.apply_row_width_input(true);
+
+        assert_eq!(app.row_width_bits, 1);
+        assert_eq!(app.target_row_width_bits, 1);
+        assert_eq!(app.row_width_input, "1");
     }
 }
