@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Duration;
@@ -12,6 +13,10 @@ use eframe::egui::{
 use egui::containers::menu::{MenuButton, MenuConfig};
 use rfd::FileDialog;
 
+use crate::autocorrelation::{
+    AutoCorrelationResult, analyze_width_autocorrelation_limited_with_progress,
+    autocorrelation_width_limit_limited,
+};
 use crate::document::BinaryDocument;
 use crate::export::{
     ExportFormat, LinkTypeOption, PcapExportOptions, WAV_CODEC_PRESETS, WavExportOptions,
@@ -26,6 +31,17 @@ use crate::viewer::{
 const DEFAULT_ROW_WIDTH_BITS: usize = 128;
 const MIN_ROW_WIDTH_BITS: usize = 1;
 const MAX_ROW_WIDTH_BITS: usize = usize::MAX;
+const DEFAULT_AUTOCORRELATION_MAX_WIDTH_BITS: usize = 512;
+const MIN_AUTOCORRELATION_MAX_WIDTH_BITS: usize = 1;
+const MAX_AUTOCORRELATION_MAX_WIDTH_BITS: usize = 8_192;
+const DEFAULT_AUTOCORRELATION_SAMPLE_BYTES: usize = 1_048_576;
+const MIN_AUTOCORRELATION_SAMPLE_BYTES: usize = 1;
+const MAX_AUTOCORRELATION_SAMPLE_BYTES: usize = 64 * 1_048_576;
+const AUTOCORRELATION_WINDOW_WIDTH: f32 = 640.0;
+const AUTOCORRELATION_WINDOW_DEFAULT_HEIGHT: f32 = 420.0;
+const AUTOCORRELATION_WINDOW_MIN_HEIGHT: f32 = 320.0;
+const AUTOCORRELATION_GRAPH_MIN_WIDTH: f32 = 280.0;
+const AUTOCORRELATION_GRAPH_MAX_WIDTH: f32 = 520.0;
 const DEFAULT_BIT_SIZE: f32 = 7.0;
 const MIN_BIT_SIZE: f32 = 2.0;
 const MAX_BIT_SIZE: f32 = 24.0;
@@ -67,6 +83,7 @@ const BIT_PANEL_DEFAULT_MAX_WIDTH: f32 = 760.0;
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const TEXT_CELL_PADDING_X: f32 = 10.0;
 const VIEWER_PANEL_GAP: f32 = 14.0;
+const AUTOCORRELATION_GRAPH_HEIGHT: f32 = 168.0;
 const WAV_SAMPLE_RATE_PRESETS: [u32; 14] = [
     8_000, 11_025, 12_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000, 88_200, 96_000, 176_400,
     192_000, 384_000,
@@ -76,6 +93,12 @@ const MAX_WAV_CHANNELS: u16 = 16;
 struct DerivedBuildResult {
     request_id: u64,
     result: Result<DerivedView, String>,
+}
+
+struct AutoCorrelationWorkerResult {
+    request_id: u64,
+    view_revision: u64,
+    result: AutoCorrelationResult,
 }
 
 struct ExportSaveDialogResult {
@@ -157,6 +180,7 @@ pub struct BitViewerApp {
     derived_view: Option<DerivedView>,
     pipeline: FilterPipeline,
     show_text_pane: bool,
+    show_autocorrelation_panel: bool,
     bit_texture: Option<TextureHandle>,
     bit_texture_key: Option<BitTextureKey>,
     row_layout_cache: Option<CachedRowLayout>,
@@ -167,6 +191,11 @@ pub struct BitViewerApp {
     row_width_input: String,
     bit_size: f32,
     target_bit_size: f32,
+    autocorrelation_result: Option<AutoCorrelationResult>,
+    autocorrelation_max_width_bits: usize,
+    autocorrelation_max_width_input: String,
+    autocorrelation_sample_bytes: usize,
+    autocorrelation_sample_bytes_input: String,
     jump_bit_input: String,
     jump_byte_input: String,
     path_input: String,
@@ -181,6 +210,11 @@ pub struct BitViewerApp {
     rebuild_rx: Option<Receiver<DerivedBuildResult>>,
     rebuild_pending: bool,
     rebuild_request_id: u64,
+    autocorrelation_rx: Option<Receiver<AutoCorrelationWorkerResult>>,
+    autocorrelation_pending: bool,
+    autocorrelation_request_id: u64,
+    autocorrelation_progress: Option<Arc<AtomicUsize>>,
+    autocorrelation_progress_total: usize,
     show_export_window: bool,
     export_format: ExportFormat,
     link_type_options: Vec<LinkTypeOption>,
@@ -208,6 +242,7 @@ impl Default for BitViewerApp {
             derived_view: None,
             pipeline: FilterPipeline::default(),
             show_text_pane: true,
+            show_autocorrelation_panel: false,
             bit_texture: None,
             bit_texture_key: None,
             row_layout_cache: None,
@@ -218,6 +253,11 @@ impl Default for BitViewerApp {
             row_width_input: DEFAULT_ROW_WIDTH_BITS.to_string(),
             bit_size: DEFAULT_BIT_SIZE,
             target_bit_size: DEFAULT_BIT_SIZE,
+            autocorrelation_result: None,
+            autocorrelation_max_width_bits: DEFAULT_AUTOCORRELATION_MAX_WIDTH_BITS,
+            autocorrelation_max_width_input: DEFAULT_AUTOCORRELATION_MAX_WIDTH_BITS.to_string(),
+            autocorrelation_sample_bytes: DEFAULT_AUTOCORRELATION_SAMPLE_BYTES,
+            autocorrelation_sample_bytes_input: DEFAULT_AUTOCORRELATION_SAMPLE_BYTES.to_string(),
             jump_bit_input: String::new(),
             jump_byte_input: String::new(),
             path_input: String::new(),
@@ -232,6 +272,11 @@ impl Default for BitViewerApp {
             rebuild_rx: None,
             rebuild_pending: false,
             rebuild_request_id: 0,
+            autocorrelation_rx: None,
+            autocorrelation_pending: false,
+            autocorrelation_request_id: 0,
+            autocorrelation_progress: None,
+            autocorrelation_progress_total: 0,
             show_export_window: false,
             export_format: ExportFormat::FlattenedBits,
             link_type_options: known_link_types(),
@@ -362,6 +407,7 @@ impl eframe::App for BitViewerApp {
     fn update(&mut self, context: &Context, _frame: &mut eframe::Frame) {
         self.poll_file_dialog();
         self.poll_rebuild();
+        self.poll_autocorrelation();
         self.poll_export_save_dialog();
         self.poll_export();
         self.handle_file_drop(context);
@@ -371,6 +417,7 @@ impl eframe::App for BitViewerApp {
 
         if self.file_dialog_pending
             || self.rebuild_pending
+            || self.autocorrelation_pending
             || self.export_save_dialog_pending
             || self.export_pending
         {
@@ -414,6 +461,7 @@ impl eframe::App for BitViewerApp {
             });
 
         self.show_shortcuts_window(context);
+        self.show_autocorrelation_window(context);
         self.show_export_window(context);
     }
 }
@@ -424,6 +472,69 @@ impl BitViewerApp {
         self.bit_texture_key = None;
         self.row_layout_cache = None;
         self.text_row_cache = None;
+    }
+
+    fn clear_autocorrelation_state(&mut self) {
+        self.autocorrelation_result = None;
+        self.autocorrelation_rx = None;
+        self.autocorrelation_pending = false;
+        self.autocorrelation_progress = None;
+        self.autocorrelation_progress_total = 0;
+    }
+
+    fn schedule_autocorrelation(&mut self) {
+        let Some(view) = self.derived_view.clone() else {
+            self.clear_autocorrelation_state();
+            return;
+        };
+
+        let request_id = self.autocorrelation_request_id.saturating_add(1);
+        let view_revision = self.derived_view_revision;
+        let max_width_bits = self.autocorrelation_max_width_bits;
+        let sample_bytes = self.autocorrelation_sample_bytes;
+        let (sender, receiver) = mpsc::channel();
+        let progress = Arc::new(AtomicUsize::new(0));
+        let progress_total =
+            autocorrelation_width_limit_limited(&view, max_width_bits, sample_bytes).max(1);
+
+        self.autocorrelation_request_id = request_id;
+        self.autocorrelation_rx = Some(receiver);
+        self.autocorrelation_pending = true;
+        self.autocorrelation_result = None;
+        self.autocorrelation_progress = Some(Arc::clone(&progress));
+        self.autocorrelation_progress_total = progress_total;
+
+        thread::spawn(move || {
+            let progress_for_worker = Arc::clone(&progress);
+            let result = analyze_width_autocorrelation_limited_with_progress(
+                &view,
+                max_width_bits,
+                sample_bytes,
+                move |completed, _total| {
+                    progress_for_worker.store(completed, Ordering::Relaxed);
+                },
+            );
+            let _ = sender.send(AutoCorrelationWorkerResult {
+                request_id,
+                view_revision,
+                result,
+            });
+        });
+    }
+
+    fn autocorrelation_progress(&self) -> Option<(usize, usize, f32)> {
+        let total = self.autocorrelation_progress_total;
+        if total == 0 {
+            return None;
+        }
+
+        let completed = self
+            .autocorrelation_progress
+            .as_ref()
+            .map(|progress| progress.load(Ordering::Relaxed).min(total))
+            .unwrap_or(0);
+        let fraction = completed as f32 / total as f32;
+        Some((completed, total, fraction))
     }
 
     fn ensure_row_layout(&mut self) -> Option<Arc<RowLayout>> {
@@ -779,6 +890,11 @@ impl BitViewerApp {
                     .ui(ui, |ui| {
                         self.show_view_menu(ui);
                     });
+                MenuButton::new("Tools")
+                    .config(self.top_bar_menu_config())
+                    .ui(ui, |ui| {
+                        self.show_tools_menu(ui);
+                    });
                 if ui
                     .add_sized([84.0, 34.0], egui::Button::new("Export"))
                     .clicked()
@@ -816,6 +932,7 @@ impl BitViewerApp {
 
         if self.file_dialog_pending
             || self.rebuild_pending
+            || self.autocorrelation_pending
             || self.export_save_dialog_pending
             || self.export_pending
             || self.document.is_some()
@@ -833,6 +950,24 @@ impl BitViewerApp {
                     ui.horizontal(|ui| {
                         ui.spinner();
                         ui.label(RichText::new("rebuilding view").small().color(TEXT_MUTED));
+                    });
+                }
+
+                if self.autocorrelation_pending {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        let label = self
+                            .autocorrelation_progress()
+                            .map(|(completed, total, fraction)| {
+                                format!(
+                                    "analyzing widths {} / {} ({:.0}%)",
+                                    completed,
+                                    total,
+                                    fraction * 100.0
+                                )
+                            })
+                            .unwrap_or_else(|| "analyzing widths".to_owned());
+                        ui.label(RichText::new(label).small().color(TEXT_MUTED));
                     });
                 }
 
@@ -1026,6 +1161,95 @@ impl BitViewerApp {
         ui.checkbox(&mut self.show_text_pane, "Show hex / ASCII pane");
     }
 
+    fn show_tools_menu(&mut self, ui: &mut Ui) {
+        self.apply_top_bar_menu_visuals(ui);
+        ui.set_min_width(340.0);
+        self.section_header(
+            ui,
+            "Tools",
+            "Open analysis panes and configure autocorrelation scans.",
+        );
+
+        let button_label = if self.show_autocorrelation_panel {
+            "Show autocorrelation"
+        } else {
+            "Open autocorrelation"
+        };
+        if ui
+            .add_sized(
+                [ui.available_width(), 34.0],
+                egui::Button::new(button_label),
+            )
+            .clicked()
+        {
+            self.show_autocorrelation_panel = true;
+        }
+
+        ui.add_space(8.0);
+        egui::Grid::new("topbar-tools-grid")
+            .num_columns(2)
+            .spacing(egui::vec2(12.0, 10.0))
+            .show(ui, |ui| {
+                ui.label(RichText::new("Corr. max").color(TEXT_MUTED));
+                let response = ui.add_sized(
+                    [96.0, 28.0],
+                    egui::TextEdit::singleline(&mut self.autocorrelation_max_width_input),
+                );
+                if response.changed() {
+                    self.apply_autocorrelation_max_width_input(false);
+                }
+                if response.lost_focus() {
+                    self.apply_autocorrelation_max_width_input(true);
+                }
+                ui.end_row();
+
+                ui.label(RichText::new("Sample bytes").color(TEXT_MUTED));
+                let response = ui.add_sized(
+                    [120.0, 28.0],
+                    egui::TextEdit::singleline(&mut self.autocorrelation_sample_bytes_input),
+                );
+                if response.changed() {
+                    self.apply_autocorrelation_sample_bytes_input(false);
+                }
+                if response.lost_focus() {
+                    self.apply_autocorrelation_sample_bytes_input(true);
+                }
+                ui.end_row();
+            });
+
+        if self.autocorrelation_pending {
+            let progress_text = self
+                .autocorrelation_progress()
+                .map(|(completed, total, fraction)| {
+                    format!(
+                        "Analyzing width correlations {} / {} ({:.0}%)",
+                        completed,
+                        total,
+                        fraction * 100.0
+                    )
+                })
+                .unwrap_or_else(|| "Analyzing width correlations".to_owned());
+            ui.label(RichText::new(progress_text).small().color(TEXT_MUTED));
+        } else if let Some(best_width_bits) = self
+            .autocorrelation_result
+            .as_ref()
+            .and_then(|result| result.best_width_bits)
+        {
+            let score = self
+                .autocorrelation_result
+                .as_ref()
+                .and_then(|result| result.best_score)
+                .unwrap_or_default();
+            ui.label(
+                RichText::new(format!(
+                    "Suggested width {best_width_bits} bits ({score:.3})"
+                ))
+                .small()
+                .color(TEXT_MUTED),
+            );
+        }
+    }
+
     fn show_help_menu(&mut self, ui: &mut Ui) {
         self.apply_top_bar_menu_visuals(ui);
         ui.set_min_width(260.0);
@@ -1073,6 +1297,27 @@ impl BitViewerApp {
                 );
                 self.status_chip(ui, &format!("{} bits/row", self.row_width_bits));
                 self.status_chip(ui, &format!("{:.0}px bits", self.bit_size));
+                if self.autocorrelation_pending {
+                    if let Some((completed, total, fraction)) = self.autocorrelation_progress() {
+                        self.status_chip(
+                            ui,
+                            &format!(
+                                "Analyzing widths {} / {} ({:.0}%)",
+                                completed,
+                                total,
+                                fraction * 100.0
+                            ),
+                        );
+                    } else {
+                        self.status_chip(ui, "Analyzing widths");
+                    }
+                } else if let Some(best_width_bits) = self
+                    .autocorrelation_result
+                    .as_ref()
+                    .and_then(|result| result.best_width_bits)
+                {
+                    self.status_chip(ui, &format!("suggested {} bits", best_width_bits));
+                }
                 if !self.pipeline.is_empty() {
                     self.status_chip(ui, &format!("{} filter(s)", self.pipeline.steps.len()));
                 }
@@ -1081,6 +1326,197 @@ impl BitViewerApp {
         }
 
         self.show_viewer(ui);
+    }
+
+    fn show_autocorrelation_pane(&mut self, ui: &mut Ui) {
+        let suggested_width_bits = self
+            .autocorrelation_result
+            .as_ref()
+            .and_then(|result| result.best_width_bits);
+        let suggested_score = self
+            .autocorrelation_result
+            .as_ref()
+            .and_then(|result| result.best_score);
+        let available_width_bits = self
+            .autocorrelation_result
+            .as_ref()
+            .map(|result| result.available_max_width_bits())
+            .unwrap_or_default();
+        let requested_width_bits = self
+            .autocorrelation_result
+            .as_ref()
+            .map(|result| result.requested_max_width_bits)
+            .unwrap_or(self.autocorrelation_max_width_bits);
+        let progress_label = self
+            .autocorrelation_progress()
+            .map(|(completed, total, fraction)| {
+                let digits = total.max(1).to_string().len();
+                (
+                    format!(
+                        "Scanning widths {completed:>digits$} / {total:>digits$}",
+                        digits = digits
+                    ),
+                    fraction,
+                )
+            });
+        let mut apply_suggested = false;
+        let mut clicked_width_bits = None;
+
+        egui::Frame::new()
+            .fill(SURFACE_BG)
+            .stroke(Stroke::new(1.0, BORDER_COLOR))
+            .inner_margin(egui::Margin::symmetric(16, 14))
+            .show(ui, |ui| {
+                ui.set_min_width(AUTOCORRELATION_WINDOW_WIDTH - 72.0);
+                ui.set_max_width(AUTOCORRELATION_WINDOW_WIDTH - 72.0);
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        self.viewer_pane_header(
+                            ui,
+                            "Autocorrelation",
+                            "click the graph to apply a row width",
+                        );
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if let Some(width_bits) = suggested_width_bits
+                            && ui.button(format!("Apply {width_bits} bits")).clicked()
+                        {
+                            apply_suggested = true;
+                        }
+                    });
+                });
+
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    self.compact_status_chip(ui, &format!("max {} bits", requested_width_bits));
+                    self.compact_status_chip(
+                        ui,
+                        &format!("sample {} bytes", self.autocorrelation_sample_bytes),
+                    );
+                    self.compact_status_chip(ui, &format!("current {} bits", self.row_width_bits));
+                    if available_width_bits > 0 && available_width_bits < requested_width_bits {
+                        self.compact_status_chip(
+                            ui,
+                            &format!("scanned {} bits", available_width_bits),
+                        );
+                    }
+                    if let Some(width_bits) = suggested_width_bits {
+                        self.compact_status_chip(ui, &format!("best {} bits", width_bits));
+                    }
+                    if let Some(score) = suggested_score {
+                        self.compact_status_chip(ui, &format!("score {score:.3}"));
+                    }
+                });
+
+                if self.autocorrelation_pending
+                    && let Some((label, fraction)) = progress_label.as_ref()
+                {
+                    ui.add_space(10.0);
+                    ui.add(
+                        egui::ProgressBar::new(*fraction)
+                            .show_percentage()
+                            .text(label),
+                    );
+                }
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Corr. max").color(TEXT_MUTED));
+                    let response = ui.add_sized(
+                        [96.0, 28.0],
+                        egui::TextEdit::singleline(&mut self.autocorrelation_max_width_input),
+                    );
+                    if response.changed() {
+                        self.apply_autocorrelation_max_width_input(false);
+                    }
+                    if response.lost_focus() {
+                        self.apply_autocorrelation_max_width_input(true);
+                    }
+                    ui.add_space(12.0);
+                    ui.label(RichText::new("Sample bytes").color(TEXT_MUTED));
+                    let response = ui.add_sized(
+                        [120.0, 28.0],
+                        egui::TextEdit::singleline(&mut self.autocorrelation_sample_bytes_input),
+                    );
+                    if response.changed() {
+                        self.apply_autocorrelation_sample_bytes_input(false);
+                    }
+                    if response.lost_focus() {
+                        self.apply_autocorrelation_sample_bytes_input(true);
+                    }
+                });
+
+                ui.add_space(10.0);
+                egui::Frame::new()
+                    .fill(SURFACE_ALT_BG)
+                    .stroke(Stroke::new(1.0, BORDER_COLOR))
+                    .corner_radius(CornerRadius::same(14))
+                    .inner_margin(egui::Margin::symmetric(12, 10))
+                    .show(ui, |ui| {
+                        if self.autocorrelation_pending {
+                            ui.vertical_centered(|ui| {
+                                ui.add_space(28.0);
+                                ui.spinner();
+                                ui.add_space(8.0);
+                                ui.label(
+                                    RichText::new("Computing width correlations")
+                                        .small()
+                                        .color(TEXT_MUTED),
+                                );
+                                ui.add_space(28.0);
+                            });
+                        } else if let Some(result) = self.autocorrelation_result.as_ref() {
+                            clicked_width_bits =
+                                paint_autocorrelation_graph(ui, result, self.row_width_bits);
+                        } else {
+                            ui.vertical_centered(|ui| {
+                                ui.add_space(28.0);
+                                ui.label(
+                                    RichText::new(
+                                        "No autocorrelation data is available for this view.",
+                                    )
+                                    .small()
+                                    .color(TEXT_MUTED),
+                                );
+                                ui.add_space(28.0);
+                            });
+                        }
+                    });
+            });
+
+        if apply_suggested && let Some(width_bits) = suggested_width_bits {
+            self.set_row_width_immediately(width_bits);
+        }
+
+        if let Some(width_bits) = clicked_width_bits {
+            self.set_row_width_immediately(width_bits);
+        }
+    }
+
+    fn show_autocorrelation_window(&mut self, context: &Context) {
+        if !self.show_autocorrelation_panel {
+            return;
+        }
+
+        let mut show_autocorrelation_panel = self.show_autocorrelation_panel;
+        egui::Window::new("Autocorrelation")
+            .open(&mut show_autocorrelation_panel)
+            .default_width(AUTOCORRELATION_WINDOW_WIDTH)
+            .default_height(AUTOCORRELATION_WINDOW_DEFAULT_HEIGHT)
+            .min_width(AUTOCORRELATION_WINDOW_WIDTH)
+            .max_width(AUTOCORRELATION_WINDOW_WIDTH)
+            .min_height(AUTOCORRELATION_WINDOW_MIN_HEIGHT)
+            .frame(
+                egui::Frame::new()
+                    .fill(SURFACE_BG)
+                    .stroke(Stroke::new(1.0, BORDER_COLOR))
+                    .corner_radius(CornerRadius::same(20))
+                    .inner_margin(egui::Margin::symmetric(18, 16)),
+            )
+            .show(context, |ui| {
+                self.show_autocorrelation_pane(ui);
+            });
+        self.show_autocorrelation_panel = show_autocorrelation_panel;
     }
 
     fn show_filter_editor(&mut self, ui: &mut Ui) -> bool {
@@ -1335,6 +1771,21 @@ impl BitViewerApp {
                 if self.rebuild_pending {
                     ui.spinner();
                     ui.label(RichText::new("processing filters").color(TEXT_MUTED));
+                }
+
+                if self.autocorrelation_pending
+                    && let Some((completed, total, fraction)) = self.autocorrelation_progress()
+                {
+                    ui.spinner();
+                    ui.label(
+                        RichText::new(format!(
+                            "analyzing widths {} / {} ({:.0}%)",
+                            completed,
+                            total,
+                            fraction * 100.0
+                        ))
+                        .color(TEXT_MUTED),
+                    );
                 }
 
                 if !self.pipeline.is_empty() {
@@ -2687,11 +3138,13 @@ impl BitViewerApp {
                         self.derived_view = Some(view);
                         self.derived_view_revision = self.derived_view_revision.saturating_add(1);
                         self.invalidate_render_caches();
+                        self.schedule_autocorrelation();
                         self.last_error = None;
                     }
                     Err(error) => {
                         self.derived_view = None;
                         self.invalidate_render_caches();
+                        self.clear_autocorrelation_state();
                         self.last_error = Some(error);
                     }
                 }
@@ -2700,7 +3153,37 @@ impl BitViewerApp {
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.rebuild_rx = None;
                 self.rebuild_pending = false;
+                self.clear_autocorrelation_state();
                 self.last_error = Some("Filtered view worker stopped unexpectedly.".to_owned());
+            }
+        }
+    }
+
+    fn poll_autocorrelation(&mut self) {
+        let Some(receiver) = &self.autocorrelation_rx else {
+            return;
+        };
+
+        match receiver.try_recv() {
+            Ok(worker_result) => {
+                if worker_result.request_id != self.autocorrelation_request_id
+                    || worker_result.view_revision != self.derived_view_revision
+                {
+                    return;
+                }
+
+                self.autocorrelation_rx = None;
+                self.autocorrelation_pending = false;
+                self.autocorrelation_progress = None;
+                self.autocorrelation_progress_total = 0;
+                self.autocorrelation_result = Some(worker_result.result);
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.autocorrelation_rx = None;
+                self.autocorrelation_pending = false;
+                self.autocorrelation_progress = None;
+                self.autocorrelation_progress_total = 0;
             }
         }
     }
@@ -2708,6 +3191,7 @@ impl BitViewerApp {
     fn schedule_rebuild(&mut self) {
         let Some(document) = &self.document else {
             self.derived_view = None;
+            self.clear_autocorrelation_state();
             return;
         };
 
@@ -2721,6 +3205,7 @@ impl BitViewerApp {
         self.rebuild_pending = true;
         self.derived_view = None;
         self.invalidate_render_caches();
+        self.clear_autocorrelation_state();
         self.clear_drawn_columns();
         self.pending_bit_scroll_to_row = Some(0);
         self.pending_text_scroll_to_row = Some(0);
@@ -2979,6 +3464,60 @@ impl BitViewerApp {
         }
     }
 
+    fn apply_autocorrelation_max_width_input(&mut self, commit: bool) {
+        let trimmed = self.autocorrelation_max_width_input.trim();
+        if trimmed.is_empty() {
+            if commit {
+                self.sync_autocorrelation_max_width_input();
+            }
+            return;
+        }
+
+        let Ok(parsed) = trimmed.parse::<usize>() else {
+            if commit {
+                self.sync_autocorrelation_max_width_input();
+            }
+            return;
+        };
+
+        let clamped = parsed.clamp(
+            MIN_AUTOCORRELATION_MAX_WIDTH_BITS,
+            MAX_AUTOCORRELATION_MAX_WIDTH_BITS,
+        );
+        self.set_autocorrelation_max_width(clamped);
+
+        if commit || parsed != clamped {
+            self.sync_autocorrelation_max_width_input();
+        }
+    }
+
+    fn apply_autocorrelation_sample_bytes_input(&mut self, commit: bool) {
+        let trimmed = self.autocorrelation_sample_bytes_input.trim();
+        if trimmed.is_empty() {
+            if commit {
+                self.sync_autocorrelation_sample_bytes_input();
+            }
+            return;
+        }
+
+        let Ok(parsed) = trimmed.parse::<usize>() else {
+            if commit {
+                self.sync_autocorrelation_sample_bytes_input();
+            }
+            return;
+        };
+
+        let clamped = parsed.clamp(
+            MIN_AUTOCORRELATION_SAMPLE_BYTES,
+            MAX_AUTOCORRELATION_SAMPLE_BYTES,
+        );
+        self.set_autocorrelation_sample_bytes(clamped);
+
+        if commit || parsed != clamped {
+            self.sync_autocorrelation_sample_bytes_input();
+        }
+    }
+
     fn set_row_width_immediately(&mut self, row_width_bits: usize) {
         let clamped = row_width_bits.clamp(MIN_ROW_WIDTH_BITS, MAX_ROW_WIDTH_BITS);
         if self.target_row_width_bits != clamped || self.row_width_bits != clamped {
@@ -2990,9 +3529,228 @@ impl BitViewerApp {
         self.row_width_input = clamped.to_string();
     }
 
+    fn set_autocorrelation_max_width(&mut self, max_width_bits: usize) {
+        let clamped = max_width_bits.clamp(
+            MIN_AUTOCORRELATION_MAX_WIDTH_BITS,
+            MAX_AUTOCORRELATION_MAX_WIDTH_BITS,
+        );
+
+        if self.autocorrelation_max_width_bits != clamped {
+            self.autocorrelation_max_width_bits = clamped;
+            self.sync_autocorrelation_max_width_input();
+            self.schedule_autocorrelation();
+        } else {
+            self.sync_autocorrelation_max_width_input();
+        }
+    }
+
+    fn set_autocorrelation_sample_bytes(&mut self, sample_bytes: usize) {
+        let clamped = sample_bytes.clamp(
+            MIN_AUTOCORRELATION_SAMPLE_BYTES,
+            MAX_AUTOCORRELATION_SAMPLE_BYTES,
+        );
+
+        if self.autocorrelation_sample_bytes != clamped {
+            self.autocorrelation_sample_bytes = clamped;
+            self.sync_autocorrelation_sample_bytes_input();
+            self.schedule_autocorrelation();
+        } else {
+            self.sync_autocorrelation_sample_bytes_input();
+        }
+    }
+
     fn sync_row_width_input(&mut self) {
         self.row_width_input = self.target_row_width_bits.to_string();
     }
+
+    fn sync_autocorrelation_max_width_input(&mut self) {
+        self.autocorrelation_max_width_input = self.autocorrelation_max_width_bits.to_string();
+    }
+
+    fn sync_autocorrelation_sample_bytes_input(&mut self) {
+        self.autocorrelation_sample_bytes_input = self.autocorrelation_sample_bytes.to_string();
+    }
+}
+
+fn paint_autocorrelation_graph(
+    ui: &mut Ui,
+    result: &AutoCorrelationResult,
+    current_width_bits: usize,
+) -> Option<usize> {
+    let available_max_width_bits = result.available_max_width_bits();
+    if available_max_width_bits == 0 {
+        return None;
+    }
+
+    let desired_size = Vec2::new(
+        ui.available_width().clamp(
+            AUTOCORRELATION_GRAPH_MIN_WIDTH,
+            AUTOCORRELATION_GRAPH_MAX_WIDTH,
+        ),
+        AUTOCORRELATION_GRAPH_HEIGHT,
+    );
+    let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::click());
+    let plot_rect = Rect::from_min_max(
+        egui::pos2(rect.left() + 14.0, rect.top() + 8.0),
+        egui::pos2(rect.right() - 14.0, rect.bottom() - 22.0),
+    );
+    let painter = ui.painter();
+    let label_font = FontId::new(11.0, FontFamily::Monospace);
+    let baseline_y = autocorrelation_graph_y(plot_rect, 0.0);
+
+    painter.line_segment(
+        [
+            egui::pos2(plot_rect.left(), baseline_y),
+            egui::pos2(plot_rect.right(), baseline_y),
+        ],
+        Stroke::new(1.0, ACCENT_SOFT),
+    );
+
+    painter.text(
+        egui::pos2(plot_rect.left(), rect.bottom() - 4.0),
+        egui::Align2::LEFT_BOTTOM,
+        "1",
+        label_font.clone(),
+        TEXT_MUTED,
+    );
+    painter.text(
+        egui::pos2(plot_rect.right(), rect.bottom() - 4.0),
+        egui::Align2::RIGHT_BOTTOM,
+        available_max_width_bits.to_string(),
+        label_font.clone(),
+        TEXT_MUTED,
+    );
+    painter.text(
+        egui::pos2(rect.left(), plot_rect.top()),
+        egui::Align2::LEFT_TOP,
+        "+1.0",
+        label_font.clone(),
+        TEXT_MUTED,
+    );
+    painter.text(
+        egui::pos2(rect.left(), baseline_y),
+        egui::Align2::LEFT_CENTER,
+        "0",
+        label_font.clone(),
+        TEXT_MUTED,
+    );
+    painter.text(
+        egui::pos2(rect.left(), plot_rect.bottom()),
+        egui::Align2::LEFT_BOTTOM,
+        "-1.0",
+        label_font.clone(),
+        TEXT_MUTED,
+    );
+
+    let mut points = Vec::with_capacity(result.samples.len());
+    for sample in &result.samples {
+        points.push(egui::pos2(
+            autocorrelation_graph_x(plot_rect, sample.width_bits, available_max_width_bits),
+            autocorrelation_graph_y(plot_rect, sample.score),
+        ));
+    }
+
+    if points.len() > 1 {
+        painter.add(egui::Shape::line(points, Stroke::new(2.0, ACCENT_COLOR)));
+    } else if let Some(point) = points.first().copied() {
+        painter.circle_filled(point, 3.0, ACCENT_COLOR);
+    }
+
+    if let Some(best_width_bits) = result.best_width_bits
+        && let Some(sample) = result.sample_for_width(best_width_bits)
+    {
+        let point = egui::pos2(
+            autocorrelation_graph_x(plot_rect, best_width_bits, available_max_width_bits),
+            autocorrelation_graph_y(plot_rect, sample.score),
+        );
+        painter.line_segment(
+            [
+                egui::pos2(point.x, plot_rect.top()),
+                egui::pos2(point.x, plot_rect.bottom()),
+            ],
+            Stroke::new(1.0, ACCENT_SOFT),
+        );
+        painter.circle_filled(point, 4.0, ACCENT_COLOR);
+    }
+
+    if let Some(sample) = result.sample_for_width(current_width_bits) {
+        let point = egui::pos2(
+            autocorrelation_graph_x(plot_rect, current_width_bits, available_max_width_bits),
+            autocorrelation_graph_y(plot_rect, sample.score),
+        );
+        painter.line_segment(
+            [
+                egui::pos2(point.x, plot_rect.top()),
+                egui::pos2(point.x, plot_rect.bottom()),
+            ],
+            Stroke::new(1.0, BYTE_DIVIDER_COLOR),
+        );
+        painter.circle_filled(point, 4.0, BYTE_DIVIDER_COLOR);
+    }
+
+    let hovered_width_bits = response.hover_pos().and_then(|pointer| {
+        autocorrelation_graph_width(plot_rect, pointer.x, available_max_width_bits)
+    });
+
+    if let Some(width_bits) = hovered_width_bits
+        && let Some(sample) = result.sample_for_width(width_bits)
+    {
+        let point = egui::pos2(
+            autocorrelation_graph_x(plot_rect, width_bits, available_max_width_bits),
+            autocorrelation_graph_y(plot_rect, sample.score),
+        );
+        painter.line_segment(
+            [
+                egui::pos2(point.x, plot_rect.top()),
+                egui::pos2(point.x, plot_rect.bottom()),
+            ],
+            Stroke::new(1.0, TEXT_PRIMARY),
+        );
+        painter.circle_filled(point, 4.0, TEXT_PRIMARY);
+        painter.text(
+            egui::pos2(rect.right() - 4.0, rect.top() + 2.0),
+            egui::Align2::RIGHT_TOP,
+            format!(
+                "{width_bits} bits  {:.3}  {} cmp",
+                sample.score, sample.comparisons
+            ),
+            label_font,
+            TEXT_PRIMARY,
+        );
+    }
+
+    if response.clicked() {
+        return hovered_width_bits;
+    }
+
+    None
+}
+
+fn autocorrelation_graph_x(plot_rect: Rect, width_bits: usize, max_width_bits: usize) -> f32 {
+    if max_width_bits <= 1 {
+        return plot_rect.center().x;
+    }
+
+    let fraction = (width_bits.saturating_sub(1)) as f32 / (max_width_bits - 1) as f32;
+    plot_rect.left() + fraction * plot_rect.width()
+}
+
+fn autocorrelation_graph_y(plot_rect: Rect, score: f32) -> f32 {
+    let normalized = ((score.clamp(-1.0, 1.0) + 1.0) * 0.5).clamp(0.0, 1.0);
+    plot_rect.bottom() - normalized * plot_rect.height()
+}
+
+fn autocorrelation_graph_width(plot_rect: Rect, x: f32, max_width_bits: usize) -> Option<usize> {
+    if max_width_bits == 0 {
+        return None;
+    }
+
+    if max_width_bits == 1 {
+        return Some(1);
+    }
+
+    let fraction = ((x - plot_rect.left()) / plot_rect.width()).clamp(0.0, 1.0);
+    Some(1 + (fraction * (max_width_bits - 1) as f32).round() as usize)
 }
 
 fn paint_bit_grid_lines(

@@ -1,4 +1,5 @@
 mod app;
+mod autocorrelation;
 mod document;
 mod export;
 mod filters;
