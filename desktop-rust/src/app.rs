@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Duration;
@@ -23,6 +23,7 @@ use crate::export::{
     default_export_file_name, export_flattened_bits, export_pcap, export_wav, known_link_types,
 };
 use crate::filters::{DerivedView, FilterPipeline, FilterStep, L2Protocol};
+use crate::run_histogram::{RunHistogramResult, analyze_run_histogram_with_progress};
 use crate::viewer::{
     BIT_VALUE_NO_DATA, RowData, RowLayout, bit_offset_to_row, build_bit_window, build_row,
     build_row_layout,
@@ -42,6 +43,11 @@ const AUTOCORRELATION_WINDOW_DEFAULT_HEIGHT: f32 = 420.0;
 const AUTOCORRELATION_WINDOW_MIN_HEIGHT: f32 = 320.0;
 const AUTOCORRELATION_GRAPH_MIN_WIDTH: f32 = 280.0;
 const AUTOCORRELATION_GRAPH_MAX_WIDTH: f32 = 520.0;
+const RUN_HISTOGRAM_WINDOW_WIDTH: f32 = 700.0;
+const RUN_HISTOGRAM_WINDOW_DEFAULT_HEIGHT: f32 = 420.0;
+const RUN_HISTOGRAM_WINDOW_MIN_HEIGHT: f32 = 320.0;
+const RUN_HISTOGRAM_GRAPH_MIN_WIDTH: f32 = 320.0;
+const RUN_HISTOGRAM_GRAPH_MAX_WIDTH: f32 = 580.0;
 const DEFAULT_BIT_SIZE: f32 = 7.0;
 const MIN_BIT_SIZE: f32 = 2.0;
 const MAX_BIT_SIZE: f32 = 24.0;
@@ -84,6 +90,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const TEXT_CELL_PADDING_X: f32 = 10.0;
 const VIEWER_PANEL_GAP: f32 = 14.0;
 const AUTOCORRELATION_GRAPH_HEIGHT: f32 = 168.0;
+const RUN_HISTOGRAM_GRAPH_HEIGHT: f32 = 192.0;
+const GRAPH_SCROLL_ZOOM_SENSITIVITY: f32 = 0.01;
+const GRAPH_MIN_Y_SPAN: f32 = 0.05;
 const WAV_SAMPLE_RATE_PRESETS: [u32; 14] = [
     8_000, 11_025, 12_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000, 88_200, 96_000, 176_400,
     192_000, 384_000,
@@ -99,6 +108,12 @@ struct AutoCorrelationWorkerResult {
     request_id: u64,
     view_revision: u64,
     result: AutoCorrelationResult,
+}
+
+struct RunHistogramWorkerResult {
+    request_id: u64,
+    view_revision: u64,
+    result: RunHistogramResult,
 }
 
 struct ExportSaveDialogResult {
@@ -175,12 +190,38 @@ struct ActiveDrawStroke {
     last_index: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GraphViewport {
+    x_start: f32,
+    x_end: f32,
+    y_start: f32,
+    y_end: f32,
+}
+
+impl Default for GraphViewport {
+    fn default() -> Self {
+        Self {
+            x_start: 0.0,
+            x_end: 1.0,
+            y_start: 0.0,
+            y_end: 1.0,
+        }
+    }
+}
+
+impl GraphViewport {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
 pub struct BitViewerApp {
     document: Option<BinaryDocument>,
     derived_view: Option<DerivedView>,
     pipeline: FilterPipeline,
     show_text_pane: bool,
     show_autocorrelation_panel: bool,
+    show_run_histogram_panel: bool,
     bit_texture: Option<TextureHandle>,
     bit_texture_key: Option<BitTextureKey>,
     row_layout_cache: Option<CachedRowLayout>,
@@ -192,10 +233,13 @@ pub struct BitViewerApp {
     bit_size: f32,
     target_bit_size: f32,
     autocorrelation_result: Option<AutoCorrelationResult>,
+    autocorrelation_graph_viewport: GraphViewport,
     autocorrelation_max_width_bits: usize,
     autocorrelation_max_width_input: String,
     autocorrelation_sample_bytes: usize,
     autocorrelation_sample_bytes_input: String,
+    run_histogram_result: Option<RunHistogramResult>,
+    run_histogram_graph_viewport: GraphViewport,
     jump_bit_input: String,
     jump_byte_input: String,
     path_input: String,
@@ -215,6 +259,12 @@ pub struct BitViewerApp {
     autocorrelation_request_id: u64,
     autocorrelation_progress: Option<Arc<AtomicUsize>>,
     autocorrelation_progress_total: usize,
+    run_histogram_rx: Option<Receiver<RunHistogramWorkerResult>>,
+    run_histogram_pending: bool,
+    run_histogram_request_id: u64,
+    run_histogram_progress: Option<Arc<AtomicUsize>>,
+    run_histogram_progress_total: usize,
+    run_histogram_cancel: Option<Arc<AtomicBool>>,
     show_export_window: bool,
     export_format: ExportFormat,
     link_type_options: Vec<LinkTypeOption>,
@@ -244,6 +294,7 @@ impl Default for BitViewerApp {
             pipeline: FilterPipeline::default(),
             show_text_pane: true,
             show_autocorrelation_panel: false,
+            show_run_histogram_panel: false,
             bit_texture: None,
             bit_texture_key: None,
             row_layout_cache: None,
@@ -255,10 +306,13 @@ impl Default for BitViewerApp {
             bit_size: DEFAULT_BIT_SIZE,
             target_bit_size: DEFAULT_BIT_SIZE,
             autocorrelation_result: None,
+            autocorrelation_graph_viewport: GraphViewport::default(),
             autocorrelation_max_width_bits: DEFAULT_AUTOCORRELATION_MAX_WIDTH_BITS,
             autocorrelation_max_width_input: DEFAULT_AUTOCORRELATION_MAX_WIDTH_BITS.to_string(),
             autocorrelation_sample_bytes: DEFAULT_AUTOCORRELATION_SAMPLE_BYTES,
             autocorrelation_sample_bytes_input: DEFAULT_AUTOCORRELATION_SAMPLE_BYTES.to_string(),
+            run_histogram_result: None,
+            run_histogram_graph_viewport: GraphViewport::default(),
             jump_bit_input: String::new(),
             jump_byte_input: String::new(),
             path_input: String::new(),
@@ -278,6 +332,12 @@ impl Default for BitViewerApp {
             autocorrelation_request_id: 0,
             autocorrelation_progress: None,
             autocorrelation_progress_total: 0,
+            run_histogram_rx: None,
+            run_histogram_pending: false,
+            run_histogram_request_id: 0,
+            run_histogram_progress: None,
+            run_histogram_progress_total: 0,
+            run_histogram_cancel: None,
             show_export_window: false,
             export_format: ExportFormat::FlattenedBits,
             link_type_options: known_link_types(),
@@ -410,6 +470,7 @@ impl eframe::App for BitViewerApp {
         self.poll_file_dialog();
         self.poll_rebuild();
         self.poll_autocorrelation();
+        self.poll_run_histogram();
         self.poll_export_save_dialog();
         self.poll_export();
         self.handle_file_drop(context);
@@ -420,6 +481,7 @@ impl eframe::App for BitViewerApp {
         if self.file_dialog_pending
             || self.rebuild_pending
             || self.autocorrelation_pending
+            || self.run_histogram_pending
             || self.export_save_dialog_pending
             || self.export_pending
         {
@@ -465,6 +527,7 @@ impl eframe::App for BitViewerApp {
         self.show_shortcuts_window(context);
         self.show_filter_help_window(context);
         self.show_autocorrelation_window(context);
+        self.show_run_histogram_window(context);
         self.show_export_window(context);
     }
 }
@@ -483,6 +546,23 @@ impl BitViewerApp {
         self.autocorrelation_pending = false;
         self.autocorrelation_progress = None;
         self.autocorrelation_progress_total = 0;
+        self.autocorrelation_graph_viewport.reset();
+    }
+
+    fn suspend_run_histogram_worker(&mut self) {
+        if let Some(cancel) = self.run_histogram_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.run_histogram_rx = None;
+        self.run_histogram_pending = false;
+        self.run_histogram_progress = None;
+        self.run_histogram_progress_total = 0;
+    }
+
+    fn clear_run_histogram_state(&mut self) {
+        self.suspend_run_histogram_worker();
+        self.run_histogram_result = None;
+        self.run_histogram_graph_viewport.reset();
     }
 
     fn schedule_autocorrelation(&mut self) {
@@ -533,6 +613,72 @@ impl BitViewerApp {
 
         let completed = self
             .autocorrelation_progress
+            .as_ref()
+            .map(|progress| progress.load(Ordering::Relaxed).min(total))
+            .unwrap_or(0);
+        let fraction = completed as f32 / total as f32;
+        Some((completed, total, fraction))
+    }
+
+    fn ensure_run_histogram(&mut self) {
+        if !self.show_run_histogram_panel
+            || self.run_histogram_pending
+            || self.run_histogram_result.is_some()
+        {
+            return;
+        }
+
+        self.schedule_run_histogram();
+    }
+
+    fn schedule_run_histogram(&mut self) {
+        let Some(view) = self.derived_view.clone() else {
+            self.clear_run_histogram_state();
+            return;
+        };
+
+        self.suspend_run_histogram_worker();
+
+        let request_id = self.run_histogram_request_id.saturating_add(1);
+        let view_revision = self.derived_view_revision;
+        let (sender, receiver) = mpsc::channel();
+        let progress = Arc::new(AtomicUsize::new(0));
+        let progress_total = view.total_bits().max(1);
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        self.run_histogram_request_id = request_id;
+        self.run_histogram_rx = Some(receiver);
+        self.run_histogram_pending = true;
+        self.run_histogram_progress = Some(Arc::clone(&progress));
+        self.run_histogram_progress_total = progress_total;
+        self.run_histogram_cancel = Some(Arc::clone(&cancel));
+
+        thread::spawn(move || {
+            let progress_for_worker = Arc::clone(&progress);
+            let cancel_for_worker = Arc::clone(&cancel);
+            let result = analyze_run_histogram_with_progress(&view, move |completed, total| {
+                progress_for_worker.store(completed.min(total), Ordering::Relaxed);
+                !cancel_for_worker.load(Ordering::Relaxed)
+            });
+
+            if let Some(result) = result {
+                let _ = sender.send(RunHistogramWorkerResult {
+                    request_id,
+                    view_revision,
+                    result,
+                });
+            }
+        });
+    }
+
+    fn run_histogram_progress(&self) -> Option<(usize, usize, f32)> {
+        let total = self.run_histogram_progress_total;
+        if total == 0 {
+            return None;
+        }
+
+        let completed = self
+            .run_histogram_progress
             .as_ref()
             .map(|progress| progress.load(Ordering::Relaxed).min(total))
             .unwrap_or(0);
@@ -936,6 +1082,7 @@ impl BitViewerApp {
         if self.file_dialog_pending
             || self.rebuild_pending
             || self.autocorrelation_pending
+            || self.run_histogram_pending
             || self.export_save_dialog_pending
             || self.export_pending
             || self.document.is_some()
@@ -970,6 +1117,24 @@ impl BitViewerApp {
                                 )
                             })
                             .unwrap_or_else(|| "analyzing widths".to_owned());
+                        ui.label(RichText::new(label).small().color(TEXT_MUTED));
+                    });
+                }
+
+                if self.run_histogram_pending {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        let label = self
+                            .run_histogram_progress()
+                            .map(|(completed, total, fraction)| {
+                                format!(
+                                    "scanning runs {} / {} ({:.0}%)",
+                                    completed,
+                                    total,
+                                    fraction * 100.0
+                                )
+                            })
+                            .unwrap_or_else(|| "scanning runs".to_owned());
                         ui.label(RichText::new(label).small().color(TEXT_MUTED));
                     });
                 }
@@ -1188,6 +1353,22 @@ impl BitViewerApp {
             self.show_autocorrelation_panel = true;
         }
 
+        let button_label = if self.show_run_histogram_panel {
+            "Show run histogram"
+        } else {
+            "Open run histogram"
+        };
+        if ui
+            .add_sized(
+                [ui.available_width(), 34.0],
+                egui::Button::new(button_label),
+            )
+            .clicked()
+        {
+            self.show_run_histogram_panel = true;
+            self.ensure_run_histogram();
+        }
+
         ui.add_space(8.0);
         egui::Grid::new("topbar-tools-grid")
             .num_columns(2)
@@ -1246,6 +1427,40 @@ impl BitViewerApp {
             ui.label(
                 RichText::new(format!(
                     "Suggested width {best_width_bits} bits ({score:.3})"
+                ))
+                .small()
+                .color(TEXT_MUTED),
+            );
+        }
+
+        if self.run_histogram_pending {
+            let progress_text = self
+                .run_histogram_progress()
+                .map(|(completed, total, fraction)| {
+                    format!(
+                        "Scanning bit runs {} / {} ({:.0}%)",
+                        completed,
+                        total,
+                        fraction * 100.0
+                    )
+                })
+                .unwrap_or_else(|| "Scanning bit runs".to_owned());
+            ui.label(RichText::new(progress_text).small().color(TEXT_MUTED));
+        } else if let Some(run_length_bits) = self
+            .run_histogram_result
+            .as_ref()
+            .and_then(|result| result.dominant_run_length_bits)
+        {
+            let fraction = self
+                .run_histogram_result
+                .as_ref()
+                .and_then(|result| result.dominant_fraction)
+                .unwrap_or_default();
+            ui.label(
+                RichText::new(format!(
+                    "Peak run {run_length_bits} bit{} ({:.1}%)",
+                    if run_length_bits == 1 { "" } else { "s" },
+                    fraction * 100.0
                 ))
                 .small()
                 .color(TEXT_MUTED),
@@ -1321,6 +1536,22 @@ impl BitViewerApp {
                 {
                     self.status_chip(ui, &format!("suggested {} bits", best_width_bits));
                 }
+                if self.run_histogram_pending {
+                    if let Some((completed, total, fraction)) = self.run_histogram_progress() {
+                        self.status_chip(
+                            ui,
+                            &format!("runs {} / {} ({:.0}%)", completed, total, fraction * 100.0),
+                        );
+                    } else {
+                        self.status_chip(ui, "scanning runs");
+                    }
+                } else if let Some(run_length_bits) = self
+                    .run_histogram_result
+                    .as_ref()
+                    .and_then(|result| result.dominant_run_length_bits)
+                {
+                    self.status_chip(ui, &format!("peak run {} bits", run_length_bits));
+                }
                 if !self.pipeline.is_empty() {
                     self.status_chip(ui, &format!("{} filter(s)", self.pipeline.steps.len()));
                 }
@@ -1377,10 +1608,13 @@ impl BitViewerApp {
                         self.viewer_pane_header(
                             ui,
                             "Autocorrelation",
-                            "click the graph to apply a row width",
+                            "wheel to zoom X, shift+wheel to zoom Y, double-click to reset",
                         );
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button("Reset zoom").clicked() {
+                            self.autocorrelation_graph_viewport.reset();
+                        }
                         if let Some(width_bits) = suggested_width_bits
                             && ui.button(format!("Apply {width_bits} bits")).clicked()
                         {
@@ -1469,8 +1703,12 @@ impl BitViewerApp {
                                 ui.add_space(28.0);
                             });
                         } else if let Some(result) = self.autocorrelation_result.as_ref() {
-                            clicked_width_bits =
-                                paint_autocorrelation_graph(ui, result, self.row_width_bits);
+                            clicked_width_bits = paint_autocorrelation_graph(
+                                ui,
+                                result,
+                                self.row_width_bits,
+                                &mut self.autocorrelation_graph_viewport,
+                            );
                         } else {
                             ui.vertical_centered(|ui| {
                                 ui.add_space(28.0);
@@ -1520,6 +1758,177 @@ impl BitViewerApp {
                 self.show_autocorrelation_pane(ui);
             });
         self.show_autocorrelation_panel = show_autocorrelation_panel;
+    }
+
+    fn show_run_histogram_pane(&mut self, ui: &mut Ui) {
+        let peak_run_length_bits = self
+            .run_histogram_result
+            .as_ref()
+            .and_then(|result| result.dominant_run_length_bits);
+        let peak_fraction = self
+            .run_histogram_result
+            .as_ref()
+            .and_then(|result| result.dominant_fraction);
+        let max_run_length_bits = self
+            .run_histogram_result
+            .as_ref()
+            .map(RunHistogramResult::max_run_length_bits)
+            .unwrap_or_default();
+        let total_runs = self
+            .run_histogram_result
+            .as_ref()
+            .map(|result| result.total_runs)
+            .unwrap_or_default();
+        let total_bits = self
+            .run_histogram_result
+            .as_ref()
+            .map(|result| result.total_bits)
+            .unwrap_or_else(|| {
+                self.derived_view
+                    .as_ref()
+                    .map(DerivedView::total_bits)
+                    .unwrap_or_default()
+            });
+        let progress_label = self
+            .run_histogram_progress()
+            .map(|(completed, total, fraction)| {
+                let digits = total.max(1).to_string().len();
+                (
+                    format!(
+                        "Scanning bits {completed:>digits$} / {total:>digits$}",
+                        digits = digits
+                    ),
+                    fraction,
+                )
+            });
+
+        egui::Frame::new()
+            .fill(SURFACE_BG)
+            .stroke(Stroke::new(1.0, BORDER_COLOR))
+            .inner_margin(egui::Margin::symmetric(16, 14))
+            .show(ui, |ui| {
+                ui.set_min_width(RUN_HISTOGRAM_WINDOW_WIDTH - 72.0);
+                ui.set_max_width(RUN_HISTOGRAM_WINDOW_WIDTH - 72.0);
+                self.viewer_pane_header(
+                    ui,
+                    "Run Histogram",
+                    "wheel to zoom X, shift+wheel to zoom Y, double-click to reset",
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Normalized counts of consecutive identical-bit runs")
+                            .small()
+                            .color(TEXT_MUTED),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button("Reset zoom").clicked() {
+                            self.run_histogram_graph_viewport.reset();
+                        }
+                    });
+                });
+
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    self.compact_status_chip(ui, &format!("{} bits", total_bits));
+                    if total_runs > 0 {
+                        self.compact_status_chip(ui, &format!("{total_runs} runs"));
+                    }
+                    if max_run_length_bits > 0 {
+                        self.compact_status_chip(ui, &format!("longest {} bits", max_run_length_bits));
+                    }
+                    if let Some(run_length_bits) = peak_run_length_bits {
+                        self.compact_status_chip(ui, &format!("peak {} bits", run_length_bits));
+                    }
+                    if let Some(fraction) = peak_fraction {
+                        self.compact_status_chip(ui, &format!("{:.1}% normalized", fraction * 100.0));
+                    }
+                });
+
+                if self.run_histogram_pending
+                    && let Some((label, fraction)) = progress_label.as_ref()
+                {
+                    ui.add_space(10.0);
+                    ui.add(
+                        egui::ProgressBar::new(*fraction)
+                            .show_percentage()
+                            .text(label),
+                    );
+                }
+
+                ui.add_space(10.0);
+                egui::Frame::new()
+                    .fill(SURFACE_ALT_BG)
+                    .stroke(Stroke::new(1.0, BORDER_COLOR))
+                    .corner_radius(CornerRadius::same(14))
+                    .inner_margin(egui::Margin::symmetric(12, 10))
+                    .show(ui, |ui| {
+                        if self.run_histogram_pending {
+                            ui.vertical_centered(|ui| {
+                                ui.add_space(28.0);
+                                ui.spinner();
+                                ui.add_space(8.0);
+                                ui.label(
+                                    RichText::new("Scanning consecutive bit runs")
+                                        .small()
+                                        .color(TEXT_MUTED),
+                                );
+                                ui.add_space(28.0);
+                            });
+                        } else if let Some(result) = self.run_histogram_result.as_ref() {
+                            paint_run_histogram_graph(
+                                ui,
+                                result,
+                                &mut self.run_histogram_graph_viewport,
+                            );
+                        } else {
+                            ui.vertical_centered(|ui| {
+                                ui.add_space(28.0);
+                                ui.label(
+                                    RichText::new(
+                                        "Open the pane with a loaded view to compute the histogram.",
+                                    )
+                                    .small()
+                                    .color(TEXT_MUTED),
+                                );
+                                ui.add_space(28.0);
+                            });
+                        }
+                    });
+            });
+    }
+
+    fn show_run_histogram_window(&mut self, context: &Context) {
+        if !self.show_run_histogram_panel {
+            return;
+        }
+
+        self.ensure_run_histogram();
+
+        let mut show_run_histogram_panel = self.show_run_histogram_panel;
+        egui::Window::new("Run Histogram")
+            .open(&mut show_run_histogram_panel)
+            .default_width(RUN_HISTOGRAM_WINDOW_WIDTH)
+            .default_height(RUN_HISTOGRAM_WINDOW_DEFAULT_HEIGHT)
+            .min_width(RUN_HISTOGRAM_WINDOW_WIDTH)
+            .max_width(RUN_HISTOGRAM_WINDOW_WIDTH)
+            .min_height(RUN_HISTOGRAM_WINDOW_MIN_HEIGHT)
+            .frame(
+                egui::Frame::new()
+                    .fill(SURFACE_BG)
+                    .stroke(Stroke::new(1.0, BORDER_COLOR))
+                    .corner_radius(CornerRadius::same(20))
+                    .inner_margin(egui::Margin::symmetric(18, 16)),
+            )
+            .show(context, |ui| {
+                self.show_run_histogram_pane(ui);
+            });
+
+        if self.show_run_histogram_panel && !show_run_histogram_panel {
+            self.suspend_run_histogram_worker();
+        }
+
+        self.show_run_histogram_panel = show_run_histogram_panel;
     }
 
     fn show_filter_editor(&mut self, ui: &mut Ui) -> bool {
@@ -3286,12 +3695,17 @@ impl BitViewerApp {
                         self.derived_view_revision = self.derived_view_revision.saturating_add(1);
                         self.invalidate_render_caches();
                         self.schedule_autocorrelation();
+                        self.clear_run_histogram_state();
+                        if self.show_run_histogram_panel {
+                            self.schedule_run_histogram();
+                        }
                         self.last_error = None;
                     }
                     Err(error) => {
                         self.derived_view = None;
                         self.invalidate_render_caches();
                         self.clear_autocorrelation_state();
+                        self.clear_run_histogram_state();
                         self.last_error = Some(error);
                     }
                 }
@@ -3301,6 +3715,7 @@ impl BitViewerApp {
                 self.rebuild_rx = None;
                 self.rebuild_pending = false;
                 self.clear_autocorrelation_state();
+                self.clear_run_histogram_state();
                 self.last_error = Some("Filtered view worker stopped unexpectedly.".to_owned());
             }
         }
@@ -3335,10 +3750,42 @@ impl BitViewerApp {
         }
     }
 
+    fn poll_run_histogram(&mut self) {
+        let Some(receiver) = &self.run_histogram_rx else {
+            return;
+        };
+
+        match receiver.try_recv() {
+            Ok(worker_result) => {
+                if worker_result.request_id != self.run_histogram_request_id
+                    || worker_result.view_revision != self.derived_view_revision
+                {
+                    return;
+                }
+
+                self.run_histogram_rx = None;
+                self.run_histogram_pending = false;
+                self.run_histogram_progress = None;
+                self.run_histogram_progress_total = 0;
+                self.run_histogram_cancel = None;
+                self.run_histogram_result = Some(worker_result.result);
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.run_histogram_rx = None;
+                self.run_histogram_pending = false;
+                self.run_histogram_progress = None;
+                self.run_histogram_progress_total = 0;
+                self.run_histogram_cancel = None;
+            }
+        }
+    }
+
     fn schedule_rebuild(&mut self) {
         let Some(document) = &self.document else {
             self.derived_view = None;
             self.clear_autocorrelation_state();
+            self.clear_run_histogram_state();
             return;
         };
 
@@ -3353,6 +3800,7 @@ impl BitViewerApp {
         self.derived_view = None;
         self.invalidate_render_caches();
         self.clear_autocorrelation_state();
+        self.clear_run_histogram_state();
         self.clear_drawn_columns();
         self.pending_bit_scroll_to_row = Some(0);
         self.pending_text_scroll_to_row = Some(0);
@@ -3723,6 +4171,7 @@ fn paint_autocorrelation_graph(
     ui: &mut Ui,
     result: &AutoCorrelationResult,
     current_width_bits: usize,
+    viewport: &mut GraphViewport,
 ) -> Option<usize> {
     let available_max_width_bits = result.available_max_width_bits();
     if available_max_width_bits == 0 {
@@ -3741,9 +4190,24 @@ fn paint_autocorrelation_graph(
         egui::pos2(rect.left() + 14.0, rect.top() + 8.0),
         egui::pos2(rect.right() - 14.0, rect.bottom() - 22.0),
     );
+    handle_graph_zoom(
+        ui,
+        &response,
+        plot_rect,
+        viewport,
+        graph_min_x_span(available_max_width_bits),
+        GRAPH_MIN_Y_SPAN,
+    );
     let painter = ui.painter();
     let label_font = FontId::new(11.0, FontFamily::Monospace);
-    let baseline_y = autocorrelation_graph_y(plot_rect, 0.0);
+    let baseline_y = autocorrelation_graph_y(plot_rect, 0.0, viewport);
+    let left_width_bits =
+        autocorrelation_width_from_global(viewport.x_start, available_max_width_bits).unwrap_or(1);
+    let right_width_bits =
+        autocorrelation_width_from_global(viewport.x_end, available_max_width_bits)
+            .unwrap_or(available_max_width_bits);
+    let top_score = autocorrelation_score_from_global_y(viewport.y_end);
+    let bottom_score = autocorrelation_score_from_global_y(viewport.y_start);
 
     painter.line_segment(
         [
@@ -3756,45 +4220,64 @@ fn paint_autocorrelation_graph(
     painter.text(
         egui::pos2(plot_rect.left(), rect.bottom() - 4.0),
         egui::Align2::LEFT_BOTTOM,
-        "1",
+        left_width_bits.to_string(),
         label_font.clone(),
         TEXT_MUTED,
     );
     painter.text(
         egui::pos2(plot_rect.right(), rect.bottom() - 4.0),
         egui::Align2::RIGHT_BOTTOM,
-        available_max_width_bits.to_string(),
+        right_width_bits.to_string(),
         label_font.clone(),
         TEXT_MUTED,
     );
     painter.text(
         egui::pos2(rect.left(), plot_rect.top()),
         egui::Align2::LEFT_TOP,
-        "+1.0",
+        format!("{top_score:+.2}"),
         label_font.clone(),
         TEXT_MUTED,
     );
     painter.text(
         egui::pos2(rect.left(), baseline_y),
         egui::Align2::LEFT_CENTER,
-        "0",
+        "0.00",
         label_font.clone(),
         TEXT_MUTED,
     );
     painter.text(
         egui::pos2(rect.left(), plot_rect.bottom()),
         egui::Align2::LEFT_BOTTOM,
-        "-1.0",
+        format!("{bottom_score:+.2}"),
         label_font.clone(),
         TEXT_MUTED,
     );
 
-    let mut points = Vec::with_capacity(result.samples.len());
-    for sample in &result.samples {
-        points.push(egui::pos2(
-            autocorrelation_graph_x(plot_rect, sample.width_bits, available_max_width_bits),
-            autocorrelation_graph_y(plot_rect, sample.score),
-        ));
+    let visible_start_width_bits =
+        autocorrelation_width_from_global(viewport.x_start, available_max_width_bits)
+            .unwrap_or(1)
+            .saturating_sub(1)
+            .max(1);
+    let visible_end_width_bits =
+        (autocorrelation_width_from_global(viewport.x_end, available_max_width_bits)
+            .unwrap_or(available_max_width_bits)
+            + 1)
+        .min(available_max_width_bits);
+
+    let mut points =
+        Vec::with_capacity(visible_end_width_bits.saturating_sub(visible_start_width_bits) + 1);
+    for width_bits in visible_start_width_bits..=visible_end_width_bits {
+        if let Some(sample) = result.sample_for_width(width_bits) {
+            points.push(egui::pos2(
+                autocorrelation_graph_x(
+                    plot_rect,
+                    sample.width_bits,
+                    available_max_width_bits,
+                    viewport,
+                ),
+                autocorrelation_graph_y(plot_rect, sample.score, viewport),
+            ));
+        }
     }
 
     if points.len() > 1 {
@@ -3805,10 +4288,16 @@ fn paint_autocorrelation_graph(
 
     if let Some(best_width_bits) = result.best_width_bits
         && let Some(sample) = result.sample_for_width(best_width_bits)
+        && autocorrelation_width_is_visible(best_width_bits, available_max_width_bits, viewport)
     {
         let point = egui::pos2(
-            autocorrelation_graph_x(plot_rect, best_width_bits, available_max_width_bits),
-            autocorrelation_graph_y(plot_rect, sample.score),
+            autocorrelation_graph_x(
+                plot_rect,
+                best_width_bits,
+                available_max_width_bits,
+                viewport,
+            ),
+            autocorrelation_graph_y(plot_rect, sample.score, viewport),
         );
         painter.line_segment(
             [
@@ -3821,30 +4310,44 @@ fn paint_autocorrelation_graph(
     }
 
     if let Some(sample) = result.sample_for_width(current_width_bits) {
-        let point = egui::pos2(
-            autocorrelation_graph_x(plot_rect, current_width_bits, available_max_width_bits),
-            autocorrelation_graph_y(plot_rect, sample.score),
-        );
-        painter.line_segment(
-            [
-                egui::pos2(point.x, plot_rect.top()),
-                egui::pos2(point.x, plot_rect.bottom()),
-            ],
-            Stroke::new(1.0, BYTE_DIVIDER_COLOR),
-        );
-        painter.circle_filled(point, 4.0, BYTE_DIVIDER_COLOR);
+        if autocorrelation_width_is_visible(current_width_bits, available_max_width_bits, viewport)
+        {
+            let point = egui::pos2(
+                autocorrelation_graph_x(
+                    plot_rect,
+                    current_width_bits,
+                    available_max_width_bits,
+                    viewport,
+                ),
+                autocorrelation_graph_y(plot_rect, sample.score, viewport),
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(point.x, plot_rect.top()),
+                    egui::pos2(point.x, plot_rect.bottom()),
+                ],
+                Stroke::new(1.0, BYTE_DIVIDER_COLOR),
+            );
+            painter.circle_filled(point, 4.0, BYTE_DIVIDER_COLOR);
+        }
     }
 
-    let hovered_width_bits = response.hover_pos().and_then(|pointer| {
-        autocorrelation_graph_width(plot_rect, pointer.x, available_max_width_bits)
-    });
+    let hovered_width_bits = response
+        .hover_pos()
+        .filter(|pointer| plot_rect.contains(*pointer))
+        .and_then(|pointer| {
+            autocorrelation_width_from_global(
+                graph_global_x_from_pointer(plot_rect, pointer.x, viewport),
+                available_max_width_bits,
+            )
+        });
 
     if let Some(width_bits) = hovered_width_bits
         && let Some(sample) = result.sample_for_width(width_bits)
     {
         let point = egui::pos2(
-            autocorrelation_graph_x(plot_rect, width_bits, available_max_width_bits),
-            autocorrelation_graph_y(plot_rect, sample.score),
+            autocorrelation_graph_x(plot_rect, width_bits, available_max_width_bits, viewport),
+            autocorrelation_graph_y(plot_rect, sample.score, viewport),
         );
         painter.line_segment(
             [
@@ -3866,28 +4369,355 @@ fn paint_autocorrelation_graph(
         );
     }
 
-    if response.clicked() {
+    if response.clicked() && !response.double_clicked() {
         return hovered_width_bits;
     }
 
     None
 }
 
-fn autocorrelation_graph_x(plot_rect: Rect, width_bits: usize, max_width_bits: usize) -> f32 {
-    if max_width_bits <= 1 {
-        return plot_rect.center().x;
+fn paint_run_histogram_graph(
+    ui: &mut Ui,
+    result: &RunHistogramResult,
+    viewport: &mut GraphViewport,
+) {
+    let max_run_length_bits = result.max_run_length_bits();
+    if max_run_length_bits == 0 || result.total_runs == 0 {
+        ui.vertical_centered(|ui| {
+            ui.add_space(28.0);
+            ui.label(
+                RichText::new("The current view does not contain any runs to chart.")
+                    .small()
+                    .color(TEXT_MUTED),
+            );
+            ui.add_space(28.0);
+        });
+        return;
     }
 
-    let fraction = (width_bits.saturating_sub(1)) as f32 / (max_width_bits - 1) as f32;
-    plot_rect.left() + fraction * plot_rect.width()
+    let peak_fraction = result.dominant_fraction.unwrap_or(0.0).max(f32::EPSILON);
+    let desired_size = Vec2::new(
+        ui.available_width()
+            .clamp(RUN_HISTOGRAM_GRAPH_MIN_WIDTH, RUN_HISTOGRAM_GRAPH_MAX_WIDTH),
+        RUN_HISTOGRAM_GRAPH_HEIGHT,
+    );
+    let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::click());
+    let plot_rect = Rect::from_min_max(
+        egui::pos2(rect.left() + 14.0, rect.top() + 8.0),
+        egui::pos2(rect.right() - 14.0, rect.bottom() - 22.0),
+    );
+    handle_graph_zoom(
+        ui,
+        &response,
+        plot_rect,
+        viewport,
+        graph_min_x_span(max_run_length_bits),
+        GRAPH_MIN_Y_SPAN,
+    );
+    let painter = ui.painter();
+    let label_font = FontId::new(11.0, FontFamily::Monospace);
+    let left_run_length_bits =
+        run_histogram_width_from_global(viewport.x_start, max_run_length_bits).unwrap_or(1);
+    let right_run_length_bits =
+        run_histogram_width_from_global(viewport.x_end, max_run_length_bits)
+            .unwrap_or(max_run_length_bits);
+    let top_fraction = peak_fraction * viewport.y_end;
+    let bottom_fraction = peak_fraction * viewport.y_start;
+
+    painter.line_segment(
+        [
+            egui::pos2(plot_rect.left(), plot_rect.bottom()),
+            egui::pos2(plot_rect.right(), plot_rect.bottom()),
+        ],
+        Stroke::new(1.0, ACCENT_SOFT),
+    );
+
+    painter.text(
+        egui::pos2(plot_rect.left(), rect.bottom() - 4.0),
+        egui::Align2::LEFT_BOTTOM,
+        left_run_length_bits.to_string(),
+        label_font.clone(),
+        TEXT_MUTED,
+    );
+    painter.text(
+        egui::pos2(plot_rect.right(), rect.bottom() - 4.0),
+        egui::Align2::RIGHT_BOTTOM,
+        right_run_length_bits.to_string(),
+        label_font.clone(),
+        TEXT_MUTED,
+    );
+    painter.text(
+        egui::pos2(rect.left(), plot_rect.top()),
+        egui::Align2::LEFT_TOP,
+        format!("{:.1}%", top_fraction * 100.0),
+        label_font.clone(),
+        TEXT_MUTED,
+    );
+    painter.text(
+        egui::pos2(rect.left(), plot_rect.bottom()),
+        egui::Align2::LEFT_BOTTOM,
+        format!("{:.1}%", bottom_fraction * 100.0),
+        label_font.clone(),
+        TEXT_MUTED,
+    );
+
+    let hovered_run_length_bits = response
+        .hover_pos()
+        .filter(|pointer| plot_rect.contains(*pointer))
+        .and_then(|pointer| {
+            run_histogram_width_from_global(
+                graph_global_x_from_pointer(plot_rect, pointer.x, viewport),
+                max_run_length_bits,
+            )
+        });
+
+    for sample in &result.samples {
+        if sample.count == 0 {
+            continue;
+        }
+
+        let global_left =
+            run_histogram_graph_left_global(sample.run_length_bits, max_run_length_bits);
+        let global_right =
+            run_histogram_graph_right_global(sample.run_length_bits, max_run_length_bits);
+        if global_right < viewport.x_start || global_left > viewport.x_end {
+            continue;
+        }
+
+        let left =
+            graph_screen_x_from_global(plot_rect, global_left.max(viewport.x_start), viewport);
+        let right =
+            graph_screen_x_from_global(plot_rect, global_right.min(viewport.x_end), viewport);
+        let top = run_histogram_graph_y(plot_rect, sample.fraction, peak_fraction, viewport);
+        let bar_rect = Rect::from_min_max(
+            egui::pos2(left, top),
+            egui::pos2(right.max(left + 1.0), plot_rect.bottom()),
+        );
+
+        let fill = if Some(sample.run_length_bits) == hovered_run_length_bits {
+            TEXT_PRIMARY
+        } else if Some(sample.run_length_bits) == result.dominant_run_length_bits {
+            BYTE_DIVIDER_COLOR
+        } else {
+            ACCENT_COLOR
+        };
+
+        if (right - left) <= 2.0 {
+            painter.line_segment(
+                [
+                    egui::pos2(bar_rect.center().x, bar_rect.top()),
+                    egui::pos2(bar_rect.center().x, bar_rect.bottom()),
+                ],
+                Stroke::new(1.0, fill),
+            );
+        } else {
+            painter.rect_filled(bar_rect.shrink2(egui::vec2(0.4, 0.0)), 0.0, fill);
+        }
+    }
+
+    if let Some(run_length_bits) = hovered_run_length_bits
+        && let Some(sample) = result.sample_for_run_length(run_length_bits)
+    {
+        let left = graph_screen_x_from_global(
+            plot_rect,
+            run_histogram_graph_left_global(run_length_bits, max_run_length_bits),
+            viewport,
+        );
+        let right = graph_screen_x_from_global(
+            plot_rect,
+            run_histogram_graph_right_global(run_length_bits, max_run_length_bits),
+            viewport,
+        );
+        let center_x = (left + right) * 0.5;
+        painter.line_segment(
+            [
+                egui::pos2(center_x, plot_rect.top()),
+                egui::pos2(center_x, plot_rect.bottom()),
+            ],
+            Stroke::new(1.0, TEXT_PRIMARY),
+        );
+        painter.text(
+            egui::pos2(rect.right() - 4.0, rect.top() + 2.0),
+            egui::Align2::RIGHT_TOP,
+            format!(
+                "{run_length_bits} bits  {} runs  {:.2}%",
+                sample.count,
+                sample.fraction * 100.0
+            ),
+            label_font,
+            TEXT_PRIMARY,
+        );
+    }
+
+    if response.double_clicked() {
+        ui.ctx().request_repaint();
+    }
 }
 
-fn autocorrelation_graph_y(plot_rect: Rect, score: f32) -> f32 {
-    let normalized = ((score.clamp(-1.0, 1.0) + 1.0) * 0.5).clamp(0.0, 1.0);
-    plot_rect.bottom() - normalized * plot_rect.height()
+fn handle_graph_zoom(
+    ui: &Ui,
+    response: &egui::Response,
+    plot_rect: Rect,
+    viewport: &mut GraphViewport,
+    min_x_span: f32,
+    min_y_span: f32,
+) {
+    let mut changed = false;
+
+    if response.double_clicked() {
+        viewport.reset();
+        changed = true;
+    }
+
+    let Some(pointer) = response
+        .hover_pos()
+        .filter(|pointer| plot_rect.contains(*pointer))
+    else {
+        if changed {
+            ui.ctx().request_repaint();
+        }
+        return;
+    };
+
+    let (scroll_delta, zoom_delta, shift) = ui.ctx().input(|input| {
+        (
+            input.smooth_scroll_delta,
+            input.zoom_delta(),
+            input.modifiers.shift,
+        )
+    });
+
+    let anchor_x = graph_global_x_from_pointer(plot_rect, pointer.x, viewport);
+    let anchor_y = graph_global_y_from_pointer(plot_rect, pointer.y, viewport);
+
+    if (zoom_delta - 1.0).abs() > 0.001 {
+        changed |= zoom_graph_axis(
+            &mut viewport.x_start,
+            &mut viewport.x_end,
+            anchor_x,
+            zoom_delta,
+            min_x_span,
+        );
+        changed |= zoom_graph_axis(
+            &mut viewport.y_start,
+            &mut viewport.y_end,
+            anchor_y,
+            zoom_delta,
+            min_y_span,
+        );
+    } else if scroll_delta.y.abs() > f32::EPSILON {
+        let scale = graph_scroll_zoom_scale(scroll_delta.y);
+        if shift {
+            changed |= zoom_graph_axis(
+                &mut viewport.y_start,
+                &mut viewport.y_end,
+                anchor_y,
+                scale,
+                min_y_span,
+            );
+        } else {
+            changed |= zoom_graph_axis(
+                &mut viewport.x_start,
+                &mut viewport.x_end,
+                anchor_x,
+                scale,
+                min_x_span,
+            );
+        }
+    }
+
+    if changed {
+        ui.ctx().request_repaint();
+    }
 }
 
-fn autocorrelation_graph_width(plot_rect: Rect, x: f32, max_width_bits: usize) -> Option<usize> {
+fn graph_scroll_zoom_scale(scroll_delta: f32) -> f32 {
+    (scroll_delta * GRAPH_SCROLL_ZOOM_SENSITIVITY)
+        .exp()
+        .clamp(0.25, 4.0)
+}
+
+fn graph_min_x_span(sample_count: usize) -> f32 {
+    if sample_count <= 4 {
+        return 1.0;
+    }
+
+    (4.0 / sample_count as f32).clamp(0.000_5, 1.0)
+}
+
+fn zoom_graph_axis(start: &mut f32, end: &mut f32, anchor: f32, scale: f32, min_span: f32) -> bool {
+    if scale <= 0.0 {
+        return false;
+    }
+
+    let span = (*end - *start).max(f32::EPSILON);
+    let new_span = (span / scale).clamp(min_span, 1.0);
+    if (new_span - span).abs() <= f32::EPSILON {
+        return false;
+    }
+
+    if new_span >= 1.0 - f32::EPSILON {
+        let changed = *start != 0.0 || *end != 1.0;
+        *start = 0.0;
+        *end = 1.0;
+        return changed;
+    }
+
+    let anchor = anchor.clamp(0.0, 1.0);
+    let anchor_fraction = ((anchor - *start) / span).clamp(0.0, 1.0);
+    let mut new_start = anchor - anchor_fraction * new_span;
+    let mut new_end = new_start + new_span;
+
+    if new_start < 0.0 {
+        new_end -= new_start;
+        new_start = 0.0;
+    }
+    if new_end > 1.0 {
+        let overflow = new_end - 1.0;
+        new_start -= overflow;
+    }
+
+    new_start = new_start.clamp(0.0, 1.0 - new_span);
+    new_end = (new_start + new_span).clamp(new_span, 1.0);
+
+    let changed =
+        (*start - new_start).abs() > f32::EPSILON || (*end - new_end).abs() > f32::EPSILON;
+    *start = new_start;
+    *end = new_end;
+    changed
+}
+
+fn graph_global_x_from_pointer(plot_rect: Rect, x: f32, viewport: &GraphViewport) -> f32 {
+    let local = ((x - plot_rect.left()) / plot_rect.width()).clamp(0.0, 1.0);
+    viewport.x_start + local * (viewport.x_end - viewport.x_start)
+}
+
+fn graph_global_y_from_pointer(plot_rect: Rect, y: f32, viewport: &GraphViewport) -> f32 {
+    let local = ((plot_rect.bottom() - y) / plot_rect.height()).clamp(0.0, 1.0);
+    viewport.y_start + local * (viewport.y_end - viewport.y_start)
+}
+
+fn graph_screen_x_from_global(plot_rect: Rect, global: f32, viewport: &GraphViewport) -> f32 {
+    let span = (viewport.x_end - viewport.x_start).max(f32::EPSILON);
+    let local = ((global - viewport.x_start) / span).clamp(0.0, 1.0);
+    plot_rect.left() + local * plot_rect.width()
+}
+
+fn graph_screen_y_from_global(plot_rect: Rect, global: f32, viewport: &GraphViewport) -> f32 {
+    let span = (viewport.y_end - viewport.y_start).max(f32::EPSILON);
+    let local = ((global - viewport.y_start) / span).clamp(0.0, 1.0);
+    plot_rect.bottom() - local * plot_rect.height()
+}
+
+fn autocorrelation_width_to_global(width_bits: usize, max_width_bits: usize) -> f32 {
+    if max_width_bits <= 1 {
+        return 0.5;
+    }
+
+    (width_bits.saturating_sub(1)) as f32 / (max_width_bits - 1) as f32
+}
+
+fn autocorrelation_width_from_global(global: f32, max_width_bits: usize) -> Option<usize> {
     if max_width_bits == 0 {
         return None;
     }
@@ -3896,8 +4726,78 @@ fn autocorrelation_graph_width(plot_rect: Rect, x: f32, max_width_bits: usize) -
         return Some(1);
     }
 
-    let fraction = ((x - plot_rect.left()) / plot_rect.width()).clamp(0.0, 1.0);
-    Some(1 + (fraction * (max_width_bits - 1) as f32).round() as usize)
+    let clamped = global.clamp(0.0, 1.0);
+    Some(1 + (clamped * (max_width_bits - 1) as f32).round() as usize)
+}
+
+fn autocorrelation_score_from_global_y(global: f32) -> f32 {
+    global.clamp(0.0, 1.0) * 2.0 - 1.0
+}
+
+fn autocorrelation_graph_x(
+    plot_rect: Rect,
+    width_bits: usize,
+    max_width_bits: usize,
+    viewport: &GraphViewport,
+) -> f32 {
+    graph_screen_x_from_global(
+        plot_rect,
+        autocorrelation_width_to_global(width_bits, max_width_bits),
+        viewport,
+    )
+}
+
+fn autocorrelation_graph_y(plot_rect: Rect, score: f32, viewport: &GraphViewport) -> f32 {
+    let normalized = ((score.clamp(-1.0, 1.0) + 1.0) * 0.5).clamp(0.0, 1.0);
+    graph_screen_y_from_global(plot_rect, normalized, viewport)
+}
+
+fn autocorrelation_width_is_visible(
+    width_bits: usize,
+    max_width_bits: usize,
+    viewport: &GraphViewport,
+) -> bool {
+    let global = autocorrelation_width_to_global(width_bits, max_width_bits);
+    global >= viewport.x_start && global <= viewport.x_end
+}
+
+fn run_histogram_graph_left_global(run_length_bits: usize, max_run_length_bits: usize) -> f32 {
+    if max_run_length_bits == 0 {
+        return 0.0;
+    }
+
+    (run_length_bits.saturating_sub(1)) as f32 / max_run_length_bits as f32
+}
+
+fn run_histogram_graph_right_global(run_length_bits: usize, max_run_length_bits: usize) -> f32 {
+    if max_run_length_bits == 0 {
+        return 1.0;
+    }
+
+    run_length_bits as f32 / max_run_length_bits as f32
+}
+
+fn run_histogram_graph_y(
+    plot_rect: Rect,
+    fraction: f32,
+    peak_fraction: f32,
+    viewport: &GraphViewport,
+) -> f32 {
+    let normalized = (fraction / peak_fraction.max(f32::EPSILON)).clamp(0.0, 1.0);
+    graph_screen_y_from_global(plot_rect, normalized, viewport)
+}
+
+fn run_histogram_width_from_global(global: f32, max_run_length_bits: usize) -> Option<usize> {
+    if max_run_length_bits == 0 {
+        return None;
+    }
+
+    if max_run_length_bits == 1 {
+        return Some(1);
+    }
+
+    let clamped = global.clamp(0.0, 0.999_999);
+    Some(1 + (clamped * max_run_length_bits as f32).floor() as usize)
 }
 
 fn paint_bit_grid_lines(
@@ -4101,8 +5001,9 @@ fn text_pane_column_step(pane_kind: TextPaneKind, text_char_width: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        BitViewerApp, DrawGranularity, TextPaneKind, pointer_bit_col_in_bit_grid,
-        pointer_byte_col_in_text_pane,
+        BitViewerApp, DrawGranularity, GraphViewport, TextPaneKind,
+        autocorrelation_width_from_global, pointer_bit_col_in_bit_grid,
+        pointer_byte_col_in_text_pane, run_histogram_width_from_global, zoom_graph_axis,
     };
     use eframe::egui::{Rect, pos2};
 
@@ -4188,5 +5089,40 @@ mod tests {
         assert_eq!(app.row_width_bits, 1);
         assert_eq!(app.target_row_width_bits, 1);
         assert_eq!(app.row_width_input, "1");
+    }
+
+    #[test]
+    fn zoom_graph_axis_keeps_anchor_visible() {
+        let mut start = 0.0;
+        let mut end = 1.0;
+
+        let changed = zoom_graph_axis(&mut start, &mut end, 0.75, 2.0, 0.1);
+
+        assert!(changed);
+        assert!(start > 0.0);
+        assert!(end < 1.0);
+        assert!(0.75 >= start && 0.75 <= end);
+    }
+
+    #[test]
+    fn zoom_graph_axis_resets_to_full_range_when_zooming_out_far_enough() {
+        let mut viewport = GraphViewport {
+            x_start: 0.2,
+            x_end: 0.4,
+            y_start: 0.0,
+            y_end: 1.0,
+        };
+
+        let changed = zoom_graph_axis(&mut viewport.x_start, &mut viewport.x_end, 0.3, 0.01, 0.1);
+
+        assert!(changed);
+        assert_eq!(viewport.x_start, 0.0);
+        assert_eq!(viewport.x_end, 1.0);
+    }
+
+    #[test]
+    fn graph_width_mapping_respects_zoomed_global_range() {
+        assert_eq!(autocorrelation_width_from_global(0.5, 9), Some(5));
+        assert_eq!(run_histogram_width_from_global(0.5, 8), Some(5));
     }
 }

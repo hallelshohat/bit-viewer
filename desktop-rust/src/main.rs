@@ -3,6 +3,7 @@ mod autocorrelation;
 mod document;
 mod export;
 mod filters;
+mod run_histogram;
 mod viewer;
 
 use app::BitViewerApp;
