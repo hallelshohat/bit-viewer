@@ -14,6 +14,9 @@ pub enum FilterStep {
     SyncOnPreamble {
         bits: String,
     },
+    Chop {
+        bits: usize,
+    },
     ReverseBitsPerByte,
     InvertBits,
     XorMask {
@@ -33,12 +36,40 @@ impl FilterStep {
     pub fn label(&self) -> &'static str {
         match self {
             Self::SyncOnPreamble { .. } => "Sync on preamble",
+            Self::Chop { .. } => "Chop",
             Self::ReverseBitsPerByte => "Reverse bits in each byte",
             Self::InvertBits => "Invert bits",
             Self::XorMask { .. } => "XOR byte mask",
             Self::Flatten => "Flatten groups",
             Self::KeepGroupsLongerThanBytes { .. } => "Keep groups longer than bytes",
             Self::SelectBitRangeFromGroup { .. } => "Select bit range from group",
+        }
+    }
+
+    pub fn help_text(&self) -> &'static str {
+        match self {
+            Self::SyncOnPreamble { .. } => {
+                "Split the current bitstream into groups whenever the preamble pattern is found."
+            }
+            Self::Chop { .. } => {
+                "Remove a fixed number of bits from the start of the file, or from the start of each group once groups exist."
+            }
+            Self::ReverseBitsPerByte => {
+                "Flip the bit order inside every byte without changing the byte positions."
+            }
+            Self::InvertBits => "Change every 0 bit to 1 and every 1 bit to 0.",
+            Self::XorMask { .. } => {
+                "XOR every byte with a mask to toggle selected bit positions consistently across the view."
+            }
+            Self::Flatten => {
+                "Concatenate all current groups into one continuous group while preserving the visible bit order."
+            }
+            Self::KeepGroupsLongerThanBytes { .. } => {
+                "Drop any group whose length is not greater than the configured byte threshold."
+            }
+            Self::SelectBitRangeFromGroup { .. } => {
+                "Keep only a fixed bit range from each group and discard the rest."
+            }
         }
     }
 }
@@ -283,6 +314,18 @@ fn build_derived_view_from_state(
 
 fn apply_step(state: PipelineState, step: &FilterStep) -> Result<PipelineState, String> {
     match step {
+        FilterStep::Chop { bits } => match state {
+            PipelineState::Flat(buffer) => Ok(PipelineState::Flat(
+                buffer.slice_bits(*bits, buffer.len_bits().saturating_sub(*bits)),
+            )),
+            PipelineState::Grouped(groups) => Ok(PipelineState::Grouped(
+                groups
+                    .into_iter()
+                    .map(|group| group.slice_bits(*bits, group.len_bits().saturating_sub(*bits)))
+                    .filter(|group| !group.is_empty())
+                    .collect(),
+            )),
+        },
         FilterStep::ReverseBitsPerByte => Ok(state.map_bytes(u8::reverse_bits)),
         FilterStep::InvertBits => Ok(state.map_bytes(|byte| !byte)),
         FilterStep::XorMask { mask } => Ok(state.map_bytes(|byte| byte ^ mask)),
@@ -517,6 +560,51 @@ mod tests {
                 vec![0, 1, 0, 1, 0, 1, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0],
             ]
         );
+    }
+
+    #[test]
+    fn chop_removes_prefix_once_when_input_is_still_flat() {
+        let bytes = [0b1101_0011];
+        let pipeline = FilterPipeline {
+            steps: vec![FilterStep::Chop { bits: 3 }],
+        };
+
+        let view = build_derived_view(&bytes, &pipeline).expect("pipeline should succeed");
+
+        assert_eq!(group_bits(&view), vec![vec![1, 0, 0, 1, 1]]);
+    }
+
+    #[test]
+    fn chop_removes_prefix_from_each_existing_group() {
+        let groups = vec![vec![0xAA], vec![0x55, 0xF0]];
+        let pipeline = FilterPipeline {
+            steps: vec![FilterStep::Chop { bits: 4 }],
+        };
+
+        let view = super::build_derived_view_from_groups(&groups, &pipeline)
+            .expect("pipeline should succeed");
+
+        assert_eq!(
+            group_bits(&view),
+            vec![vec![1, 0, 1, 0], vec![0, 1, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0],]
+        );
+    }
+
+    #[test]
+    fn chop_removes_prefix_from_groups_created_earlier_in_pipeline() {
+        let bytes = [0b1010_0001, 0b1010_1111];
+        let pipeline = FilterPipeline {
+            steps: vec![
+                FilterStep::SyncOnPreamble {
+                    bits: "1010".to_owned(),
+                },
+                FilterStep::Chop { bits: 4 },
+            ],
+        };
+
+        let view = build_derived_view(&bytes, &pipeline).expect("pipeline should succeed");
+
+        assert_eq!(group_bits(&view), vec![vec![0, 0, 0, 1], vec![1, 1, 1, 1],]);
     }
 
     #[test]

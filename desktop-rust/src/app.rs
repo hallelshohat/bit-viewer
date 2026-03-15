@@ -231,6 +231,7 @@ pub struct BitViewerApp {
     export_pending: bool,
     export_request_id: u64,
     show_shortcuts: bool,
+    show_filter_help: bool,
     last_export_message: Option<String>,
     last_error: Option<String>,
 }
@@ -293,6 +294,7 @@ impl Default for BitViewerApp {
             export_pending: false,
             export_request_id: 0,
             show_shortcuts: false,
+            show_filter_help: false,
             last_export_message: None,
             last_error: None,
         }
@@ -461,6 +463,7 @@ impl eframe::App for BitViewerApp {
             });
 
         self.show_shortcuts_window(context);
+        self.show_filter_help_window(context);
         self.show_autocorrelation_window(context);
         self.show_export_window(context);
     }
@@ -1538,11 +1541,24 @@ impl BitViewerApp {
         let mut move_down = None;
         let mut delete = None;
 
-        self.section_header(
-            ui,
-            "Filter Pipeline",
-            "Stack filters in order. Group-aware steps only work after a sync or grouping stage.",
-        );
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(RichText::new("Filter Pipeline").strong().color(TEXT_PRIMARY));
+                ui.label(
+                    RichText::new(
+                        "Stack filters in order. Group-aware steps only work after a sync or grouping stage.",
+                    )
+                    .small()
+                    .color(TEXT_MUTED),
+                );
+            });
+            ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                if ui.small_button("Help").clicked() {
+                    self.show_filter_help = true;
+                }
+            });
+        });
+        ui.add_space(4.0);
 
         if self.pipeline.is_empty() {
             ui.label(
@@ -1587,6 +1603,23 @@ impl BitViewerApp {
                         if response.inner.changed() {
                             changed = true;
                         }
+                    }
+                    FilterStep::Chop { bits } => {
+                        egui::Grid::new(("chop-grid", index))
+                            .num_columns(2)
+                            .spacing(egui::vec2(12.0, 10.0))
+                            .show(ui, |ui| {
+                                ui.label(RichText::new("Bits").color(TEXT_MUTED));
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(bits).range(0..=usize::MAX).speed(1.0),
+                                    )
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
+                                ui.end_row();
+                            });
                     }
                     FilterStep::ReverseBitsPerByte
                     | FilterStep::InvertBits
@@ -1700,26 +1733,32 @@ impl BitViewerApp {
                     });
                     changed = true;
                 }
+                if ui.button("Chop").clicked() {
+                    self.pipeline.steps.push(FilterStep::Chop { bits: 8 });
+                    changed = true;
+                }
+                ui.end_row();
+
                 if ui.button("Reverse bytes").clicked() {
                     self.pipeline.steps.push(FilterStep::ReverseBitsPerByte);
                     changed = true;
                 }
-                ui.end_row();
-
                 if ui.button("Invert bits").clicked() {
                     self.pipeline.steps.push(FilterStep::InvertBits);
                     changed = true;
                 }
+                ui.end_row();
+
                 if ui.button("Flatten").clicked() {
                     self.pipeline.steps.push(FilterStep::Flatten);
                     changed = true;
                 }
-                ui.end_row();
-
                 if ui.button("XOR mask").clicked() {
                     self.pipeline.steps.push(FilterStep::XorMask { mask: 0xFF });
                     changed = true;
                 }
+                ui.end_row();
+
                 if ui.button("Keep groups > N bytes").clicked() {
                     self.pipeline
                         .steps
@@ -1750,6 +1789,57 @@ impl BitViewerApp {
         }
 
         changed
+    }
+
+    fn show_filter_help_window(&mut self, context: &Context) {
+        if !self.show_filter_help {
+            return;
+        }
+
+        let mut show_filter_help = self.show_filter_help;
+        egui::Window::new("Filter Help")
+            .open(&mut show_filter_help)
+            .resizable(false)
+            .collapsible(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(SURFACE_BG)
+                    .stroke(Stroke::new(1.0, BORDER_COLOR))
+                    .corner_radius(CornerRadius::same(20))
+                    .inner_margin(18),
+            )
+            .show(context, |ui| {
+                self.section_header(
+                    ui,
+                    "Filter Help",
+                    "Each filter changes the current view in order from top to bottom.",
+                );
+
+                let filter_help_steps = [
+                    FilterStep::SyncOnPreamble {
+                        bits: String::new(),
+                    },
+                    FilterStep::Chop { bits: 0 },
+                    FilterStep::ReverseBitsPerByte,
+                    FilterStep::InvertBits,
+                    FilterStep::XorMask { mask: 0 },
+                    FilterStep::Flatten,
+                    FilterStep::KeepGroupsLongerThanBytes { min_bytes: 0 },
+                    FilterStep::SelectBitRangeFromGroup {
+                        start_bit: 0,
+                        length_bits: 0,
+                    },
+                ];
+
+                for step in filter_help_steps {
+                    self.compact_card_frame(SURFACE_ALT_BG).show(ui, |ui| {
+                        ui.label(RichText::new(step.label()).strong().color(TEXT_PRIMARY));
+                        ui.label(RichText::new(step.help_text()).small().color(TEXT_MUTED));
+                    });
+                    ui.add_space(6.0);
+                }
+            });
+        self.show_filter_help = show_filter_help;
     }
 
     fn show_status(&self, ui: &mut Ui) {
