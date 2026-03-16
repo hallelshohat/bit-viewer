@@ -7,8 +7,9 @@ use std::thread;
 use std::time::Duration;
 
 use eframe::egui::{
-    self, Align, Color32, Context, CornerRadius, FontFamily, FontId, Key, Layout, PointerButton,
-    Rect, RichText, ScrollArea, Stroke, TextureHandle, Ui, Vec2,
+    self, Align, Color32, Context, CornerRadius, FontFamily, FontId, Id, Key, Layout, Modifiers,
+    PointerButton, Rect, RichText, ScrollArea, Stroke, TextureHandle, Ui, Vec2,
+    text::{CCursor, CCursorRange},
 };
 use egui::containers::menu::{MenuButton, MenuConfig};
 use rfd::FileDialog;
@@ -22,7 +23,11 @@ use crate::export::{
     ExportFormat, LinkTypeOption, PcapExportOptions, WAV_CODEC_PRESETS, WavExportOptions,
     default_export_file_name, export_flattened_bits, export_pcap, export_wav, known_link_types,
 };
-use crate::filters::{DerivedView, FilterPipeline, FilterStep, L2Protocol};
+use crate::filters::{
+    CachedFilterState, DerivedView, FilterPipeline, FilterStep, L2Protocol,
+    append_filter_to_cached_state, complete_filter_command, filter_command_specs,
+    filter_command_suggestions, parse_filter_command,
+};
 use crate::run_histogram::{RunHistogramResult, analyze_run_histogram_with_progress};
 use crate::viewer::{
     BIT_VALUE_NO_DATA, RowData, RowLayout, bit_offset_to_row, build_bit_window, build_row,
@@ -41,6 +46,9 @@ const MAX_AUTOCORRELATION_SAMPLE_BYTES: usize = 64 * 1_048_576;
 const AUTOCORRELATION_WINDOW_WIDTH: f32 = 640.0;
 const AUTOCORRELATION_WINDOW_DEFAULT_HEIGHT: f32 = 420.0;
 const AUTOCORRELATION_WINDOW_MIN_HEIGHT: f32 = 320.0;
+const FILTER_WINDOW_WIDTH: f32 = 560.0;
+const FILTER_WINDOW_DEFAULT_HEIGHT: f32 = 620.0;
+const FILTER_WINDOW_MIN_HEIGHT: f32 = 420.0;
 const AUTOCORRELATION_GRAPH_MIN_WIDTH: f32 = 280.0;
 const AUTOCORRELATION_GRAPH_MAX_WIDTH: f32 = 520.0;
 const RUN_HISTOGRAM_WINDOW_WIDTH: f32 = 700.0;
@@ -73,6 +81,7 @@ const TOP_BAR_MENU_ALT_BG: Color32 = Color32::from_rgb(31, 50, 84);
 const BORDER_COLOR: Color32 = Color32::from_rgb(72, 92, 126);
 const ACCENT_COLOR: Color32 = Color32::from_rgb(118, 203, 255);
 const ACCENT_SOFT: Color32 = Color32::from_rgb(44, 96, 148);
+const HIGHLIGHT_COLOR: Color32 = Color32::from_rgb(255, 196, 64);
 const TEXT_PRIMARY: Color32 = Color32::from_rgb(245, 248, 255);
 const TEXT_MUTED: Color32 = Color32::from_rgb(182, 194, 217);
 const ERROR_COLOR: Color32 = Color32::from_rgb(255, 119, 119);
@@ -88,7 +97,6 @@ const BIT_PANEL_MIN_WIDTH: f32 = 320.0;
 const BIT_PANEL_DEFAULT_MAX_WIDTH: f32 = 760.0;
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const TEXT_CELL_PADDING_X: f32 = 10.0;
-const VIEWER_PANEL_GAP: f32 = 14.0;
 const AUTOCORRELATION_GRAPH_HEIGHT: f32 = 168.0;
 const RUN_HISTOGRAM_GRAPH_HEIGHT: f32 = 192.0;
 const GRAPH_SCROLL_ZOOM_SENSITIVITY: f32 = 0.01;
@@ -101,7 +109,18 @@ const MAX_WAV_CHANNELS: u16 = 16;
 
 struct DerivedBuildResult {
     request_id: u64,
-    result: Result<DerivedView, String>,
+    result: Result<CachedFilterState, String>,
+}
+
+enum RebuildMode {
+    Full {
+        path: PathBuf,
+        pipeline: FilterPipeline,
+    },
+    AppendLast {
+        cached_state: CachedFilterState,
+        step: FilterStep,
+    },
 }
 
 struct AutoCorrelationWorkerResult {
@@ -215,9 +234,17 @@ impl GraphViewport {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CommandFeedback {
+    message: String,
+    is_error: bool,
+}
+
 pub struct BitViewerApp {
     document: Option<BinaryDocument>,
     derived_view: Option<DerivedView>,
+    cached_filter_state: Option<CachedFilterState>,
+    cached_filter_pipeline: Option<FilterPipeline>,
     pipeline: FilterPipeline,
     show_text_pane: bool,
     show_autocorrelation_panel: bool,
@@ -266,6 +293,14 @@ pub struct BitViewerApp {
     run_histogram_progress_total: usize,
     run_histogram_cancel: Option<Arc<AtomicBool>>,
     show_export_window: bool,
+    show_filters_window: bool,
+    filter_command_input: String,
+    filter_command_feedback: Option<CommandFeedback>,
+    focus_filter_command_input: bool,
+    show_row_width_prompt: bool,
+    row_width_prompt_input: String,
+    row_width_prompt_feedback: Option<CommandFeedback>,
+    focus_row_width_prompt_input: bool,
     export_format: ExportFormat,
     link_type_options: Vec<LinkTypeOption>,
     selected_link_type: u32,
@@ -291,6 +326,8 @@ impl Default for BitViewerApp {
         Self {
             document: None,
             derived_view: None,
+            cached_filter_state: None,
+            cached_filter_pipeline: None,
             pipeline: FilterPipeline::default(),
             show_text_pane: true,
             show_autocorrelation_panel: false,
@@ -339,6 +376,14 @@ impl Default for BitViewerApp {
             run_histogram_progress_total: 0,
             run_histogram_cancel: None,
             show_export_window: false,
+            show_filters_window: false,
+            filter_command_input: String::new(),
+            filter_command_feedback: None,
+            focus_filter_command_input: false,
+            show_row_width_prompt: false,
+            row_width_prompt_input: String::new(),
+            row_width_prompt_feedback: None,
+            focus_row_width_prompt_input: false,
             export_format: ExportFormat::FlattenedBits,
             link_type_options: known_link_types(),
             selected_link_type: 1,
@@ -526,6 +571,8 @@ impl eframe::App for BitViewerApp {
 
         self.show_shortcuts_window(context);
         self.show_filter_help_window(context);
+        self.show_filters_window(context);
+        self.show_row_width_prompt_window(context);
         self.show_autocorrelation_window(context);
         self.show_run_histogram_window(context);
         self.show_export_window(context);
@@ -740,7 +787,8 @@ impl BitViewerApp {
 
     fn finish_active_draw_stroke_on_release(&mut self, context: &Context) {
         if self.active_draw_stroke.is_some()
-            && !context.input(|input| input.pointer.secondary_down())
+            && !context
+                .input(|input| input.pointer.primary_down() || input.pointer.secondary_down())
         {
             self.active_draw_stroke = None;
         }
@@ -830,19 +878,6 @@ impl BitViewerApp {
         ranges
     }
 
-    fn is_bit_drawn(&self, bit_col: usize) -> bool {
-        self.drawn_bit_columns.contains(&bit_col)
-    }
-
-    fn is_byte_drawn(&self, byte_col: usize) -> bool {
-        let start_bit = byte_col.saturating_mul(8);
-        let end_bit = ((byte_col + 1).saturating_mul(8)).min(self.row_width_bits);
-        self.drawn_bit_columns
-            .range(start_bit..end_bit)
-            .next()
-            .is_some()
-    }
-
     fn granularity_limit(&self, granularity: DrawGranularity) -> usize {
         match granularity {
             DrawGranularity::Bit => self.row_width_bits,
@@ -895,24 +930,12 @@ impl BitViewerApp {
         }
     }
 
-    fn start_draw_stroke(&mut self, granularity: DrawGranularity, index: usize) {
-        let mode = match granularity {
-            DrawGranularity::Bit => {
-                if self.is_bit_drawn(index) {
-                    DrawStrokeMode::Erase
-                } else {
-                    DrawStrokeMode::Paint
-                }
-            }
-            DrawGranularity::Byte => {
-                if self.is_byte_drawn(index) {
-                    DrawStrokeMode::Erase
-                } else {
-                    DrawStrokeMode::Paint
-                }
-            }
-        };
-
+    fn start_draw_stroke(
+        &mut self,
+        granularity: DrawGranularity,
+        index: usize,
+        mode: DrawStrokeMode,
+    ) {
         self.apply_draw_segment(granularity, index, index, mode);
         self.active_draw_stroke = Some(ActiveDrawStroke {
             mode,
@@ -921,23 +944,23 @@ impl BitViewerApp {
         });
     }
 
-    fn update_draw_stroke(&mut self, granularity: DrawGranularity, index: usize) {
+    fn update_draw_stroke(
+        &mut self,
+        granularity: DrawGranularity,
+        index: usize,
+        mode: DrawStrokeMode,
+    ) {
         match self.active_draw_stroke {
-            Some(mut stroke) if stroke.granularity == granularity => {
+            Some(mut stroke) if stroke.granularity == granularity && stroke.mode == mode => {
                 self.apply_draw_segment(granularity, stroke.last_index, index, stroke.mode);
                 stroke.last_index = index;
                 self.active_draw_stroke = Some(stroke);
             }
-            Some(stroke) => {
-                self.apply_draw_segment(granularity, index, index, stroke.mode);
-                self.active_draw_stroke = Some(ActiveDrawStroke {
-                    mode: stroke.mode,
-                    granularity,
-                    last_index: index,
-                });
-            }
             None => {
-                self.start_draw_stroke(granularity, index);
+                self.start_draw_stroke(granularity, index, mode);
+            }
+            Some(_) => {
+                self.start_draw_stroke(granularity, index, mode);
             }
         }
     }
@@ -945,25 +968,61 @@ impl BitViewerApp {
     fn handle_draw_input(
         &mut self,
         ui: &Ui,
+        scroll_area_id: Id,
         rect: Rect,
+        scrollbar_rects: &[Rect],
         granularity: DrawGranularity,
         index: Option<usize>,
     ) {
-        let (pointer_pos, secondary_pressed, secondary_down) = ui.ctx().input(|input| {
+        let dragged_id = ui.ctx().dragged_id();
+        if dragged_id == Some(scroll_area_id.with(0)) || dragged_id == Some(scroll_area_id.with(1))
+        {
+            return;
+        }
+
+        let (
+            pointer_pos,
+            press_origin,
+            primary_pressed,
+            primary_down,
+            secondary_pressed,
+            secondary_down,
+        ) = ui.ctx().input(|input| {
             (
-                input.pointer.interact_pos(),
+                input.pointer.latest_pos(),
+                input.pointer.press_origin(),
+                input.pointer.primary_pressed(),
+                input.pointer.primary_down(),
                 input.pointer.secondary_pressed(),
                 input.pointer.secondary_down(),
             )
         });
 
-        if !secondary_down {
+        let mode = match (primary_down, secondary_down) {
+            (true, false) => DrawStrokeMode::Paint,
+            (false, true) => DrawStrokeMode::Erase,
+            _ => return,
+        };
+
+        if !primary_down && !secondary_down {
             return;
         }
 
         let Some(pointer_pos) = pointer_pos else {
             return;
         };
+        let Some(press_origin) = press_origin else {
+            return;
+        };
+        if scrollbar_rects
+            .iter()
+            .any(|scrollbar_rect| scrollbar_rect.contains(press_origin))
+        {
+            return;
+        }
+        if !rect.contains(press_origin) {
+            return;
+        }
         if !rect.contains(pointer_pos) {
             return;
         }
@@ -974,13 +1033,22 @@ impl BitViewerApp {
             return;
         }
 
-        if secondary_pressed {
-            self.start_draw_stroke(granularity, index);
+        let stroke_started = match mode {
+            DrawStrokeMode::Paint => primary_pressed,
+            DrawStrokeMode::Erase => secondary_pressed,
+        };
+
+        if stroke_started {
+            self.start_draw_stroke(granularity, index, mode);
             ui.ctx().request_repaint();
             return;
         }
 
-        self.update_draw_stroke(granularity, index);
+        if self.active_draw_stroke.is_none() {
+            return;
+        }
+
+        self.update_draw_stroke(granularity, index, mode);
         ui.ctx().request_repaint();
     }
 
@@ -1056,20 +1124,12 @@ impl BitViewerApp {
                 } else {
                     format!("Filters ({})", self.pipeline.steps.len())
                 };
-                MenuButton::new(filter_label)
-                    .config(self.top_bar_menu_config())
-                    .ui(ui, |ui| {
-                        ui.set_min_width(420.0);
-                        ScrollArea::vertical()
-                            .id_salt("filters-menu-scroll")
-                            .max_height(520.0)
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                if self.show_filter_editor(ui) {
-                                    self.schedule_rebuild();
-                                }
-                            });
-                    });
+                if ui
+                    .add_sized([112.0, 34.0], egui::Button::new(filter_label))
+                    .clicked()
+                {
+                    self.open_filters_window();
+                }
 
                 MenuButton::new("Help")
                     .config(self.top_bar_menu_config())
@@ -1488,11 +1548,14 @@ impl BitViewerApp {
         }
 
         ui.separator();
-        ui.monospace("[ / ]  row width");
+        ui.monospace("w      row width prompt");
+        ui.monospace("f      filters window");
+        ui.monospace("[ / ]  row width step");
         ui.monospace("- / =  bit size");
         ui.monospace("h      toggle text pane");
         ui.monospace("Home / End / PgUp / PgDn  navigation");
-        ui.monospace("Right-click drag in a pane  draw selection");
+        ui.monospace("Left-click drag in a pane   paint highlight");
+        ui.monospace("Right-click drag in a pane  erase highlight");
         ui.monospace("Middle-click in a pane      align all scroll positions");
     }
 
@@ -1969,6 +2032,11 @@ impl BitViewerApp {
         });
         ui.add_space(4.0);
 
+        if self.show_filter_command_bar(ui) {
+            changed = true;
+        }
+        ui.add_space(6.0);
+
         if self.pipeline.is_empty() {
             ui.label(
                 RichText::new("No filters. The whole file is shown as one continuous stream.")
@@ -2169,76 +2237,6 @@ impl BitViewerApp {
             changed = true;
         }
 
-        ui.separator();
-        ui.label(RichText::new("Add step").color(TEXT_MUTED));
-        egui::Grid::new("filter-add-grid")
-            .num_columns(2)
-            .spacing(egui::vec2(10.0, 10.0))
-            .show(ui, |ui| {
-                if ui.button("Sync on preamble").clicked() {
-                    self.pipeline.steps.push(FilterStep::SyncOnPreamble {
-                        bits: "1010".to_owned(),
-                    });
-                    changed = true;
-                }
-                if ui.button("Split").clicked() {
-                    self.pipeline
-                        .steps
-                        .push(FilterStep::Split { group_size_bits: 8 });
-                    changed = true;
-                }
-                ui.end_row();
-
-                if ui.button("Chop").clicked() {
-                    self.pipeline.steps.push(FilterStep::Chop { bits: 8 });
-                    changed = true;
-                }
-                if ui.button("Reverse bytes").clicked() {
-                    self.pipeline.steps.push(FilterStep::ReverseBitsPerByte);
-                    changed = true;
-                }
-                ui.end_row();
-
-                if ui.button("Invert bits").clicked() {
-                    self.pipeline.steps.push(FilterStep::InvertBits);
-                    changed = true;
-                }
-                if ui.button("XOR mask").clicked() {
-                    self.pipeline.steps.push(FilterStep::XorMask { mask: 0xFF });
-                    changed = true;
-                }
-                ui.end_row();
-
-                if ui.button("Flatten").clicked() {
-                    self.pipeline.steps.push(FilterStep::Flatten);
-                    changed = true;
-                }
-                if ui.button("Keep groups > N bytes").clicked() {
-                    self.pipeline
-                        .steps
-                        .push(FilterStep::KeepGroupsLongerThanBytes { min_bytes: 6 });
-                    changed = true;
-                }
-                if ui.button("Select bit range").clicked() {
-                    self.pipeline
-                        .steps
-                        .push(FilterStep::SelectBitRangeFromGroup {
-                            start_bit: 0,
-                            length_bits: 48,
-                        });
-                    changed = true;
-                }
-                ui.end_row();
-
-                if ui.button("Extract L2 packets").clicked() {
-                    self.pipeline.steps.push(FilterStep::ExtractL2Packets {
-                        protocol: L2Protocol::Ethernet,
-                    });
-                    changed = true;
-                }
-                ui.end_row();
-            });
-
         if ui
             .add_sized(
                 [ui.available_width(), 34.0],
@@ -2251,6 +2249,205 @@ impl BitViewerApp {
         }
 
         changed
+    }
+
+    fn show_filter_command_bar(&mut self, ui: &mut Ui) -> bool {
+        let mut changed = false;
+        self.compact_card_frame(SURFACE_ALT_BG).show(ui, |ui| {
+            ui.label(
+                RichText::new("Add filter from keyboard")
+                    .strong()
+                    .color(TEXT_PRIMARY),
+            );
+            ui.label(
+                RichText::new(
+                    "Type a command such as `split 256`, `chop 8`, or `extract ethernet`. Press Tab to complete the command name.",
+                )
+                .small()
+                .color(TEXT_MUTED),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let filter_command_id = ui.make_persistent_id("filter-command-input");
+                if ui.memory(|memory| memory.has_focus(filter_command_id))
+                    && ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Tab))
+                    && let Some(completed) =
+                        complete_filter_command(&self.filter_command_input)
+                {
+                    self.filter_command_input = completed;
+                    if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), filter_command_id)
+                    {
+                        let cursor = CCursor::new(self.filter_command_input.chars().count());
+                        state.cursor.set_char_range(Some(CCursorRange::one(cursor)));
+                        state.store(ui.ctx(), filter_command_id);
+                    }
+                    self.filter_command_feedback = None;
+                    self.focus_filter_command_input = true;
+                }
+
+                let response = ui.add_sized(
+                    [ui.available_width() - 72.0, 32.0],
+                    egui::TextEdit::singleline(&mut self.filter_command_input)
+                        .id(filter_command_id)
+                        .lock_focus(true)
+                        .hint_text("split 256"),
+                );
+                if self.focus_filter_command_input {
+                    response.request_focus();
+                    self.focus_filter_command_input = false;
+                }
+                if response.changed() {
+                    self.filter_command_feedback = None;
+                }
+
+                let submit =
+                    response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
+                if ui.button("Add").clicked() || submit {
+                    changed = self.submit_filter_command();
+                }
+            });
+
+            if let Some(feedback) = self.filter_command_feedback.as_ref() {
+                self.show_command_feedback(ui, feedback);
+            }
+
+            let suggestions = filter_command_suggestions(&self.filter_command_input);
+            if !suggestions.is_empty() {
+                ui.add_space(6.0);
+                ui.label(RichText::new("Examples").small().color(TEXT_MUTED));
+                ui.horizontal_wrapped(|ui| {
+                    for spec in suggestions.into_iter().take(6) {
+                        if ui.small_button(spec.example).clicked() {
+                            self.filter_command_input = spec.example.to_owned();
+                            self.filter_command_feedback = None;
+                            self.focus_filter_command_input = true;
+                        }
+                    }
+                });
+            }
+        });
+
+        changed
+    }
+
+    fn show_command_feedback(&self, ui: &mut Ui, feedback: &CommandFeedback) {
+        let (fill, stroke, text_color) = if feedback.is_error {
+            (
+                Color32::from_rgb(58, 22, 28),
+                Color32::from_rgb(108, 45, 52),
+                ERROR_COLOR,
+            )
+        } else {
+            (SUCCESS_BG, SUCCESS_BORDER, TEXT_PRIMARY)
+        };
+
+        ui.add_space(8.0);
+        egui::Frame::new()
+            .fill(fill)
+            .stroke(Stroke::new(1.0, stroke))
+            .corner_radius(CornerRadius::same(12))
+            .inner_margin(egui::Margin::symmetric(10, 8))
+            .show(ui, |ui| {
+                ui.colored_label(text_color, &feedback.message);
+            });
+    }
+
+    fn show_filters_window(&mut self, context: &Context) {
+        if !self.show_filters_window {
+            return;
+        }
+
+        let mut show_filters_window = self.show_filters_window;
+        let mut close_requested = false;
+        let mut rebuild_requested = false;
+        egui::Window::new("Filters")
+            .open(&mut show_filters_window)
+            .default_width(FILTER_WINDOW_WIDTH)
+            .default_height(FILTER_WINDOW_DEFAULT_HEIGHT)
+            .min_width(FILTER_WINDOW_WIDTH)
+            .min_height(FILTER_WINDOW_MIN_HEIGHT)
+            .frame(
+                egui::Frame::new()
+                    .fill(SURFACE_BG)
+                    .stroke(Stroke::new(1.0, BORDER_COLOR))
+                    .corner_radius(CornerRadius::same(20))
+                    .inner_margin(egui::Margin::symmetric(18, 16)),
+            )
+            .show(context, |ui| {
+                if ui.input(|input| input.key_pressed(Key::Escape)) {
+                    close_requested = true;
+                }
+                ScrollArea::vertical()
+                    .id_salt("filters-window-scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if self.show_filter_editor(ui) {
+                            rebuild_requested = true;
+                        }
+                    });
+            });
+
+        if rebuild_requested {
+            self.schedule_rebuild();
+        }
+
+        self.show_filters_window = show_filters_window && !close_requested;
+    }
+
+    fn show_row_width_prompt_window(&mut self, context: &Context) {
+        if !self.show_row_width_prompt {
+            return;
+        }
+
+        let mut show_row_width_prompt = self.show_row_width_prompt;
+        let mut close_requested = false;
+        egui::Window::new("Row Width")
+            .open(&mut show_row_width_prompt)
+            .resizable(false)
+            .collapsible(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(SURFACE_BG)
+                    .stroke(Stroke::new(1.0, BORDER_COLOR))
+                    .corner_radius(CornerRadius::same(20))
+                    .inner_margin(18),
+            )
+            .show(context, |ui| {
+                self.section_header(
+                    ui,
+                    "Row Width",
+                    "Press `w`, type a width in bits, then press Enter.",
+                );
+                let response = ui.add_sized(
+                    [220.0, 32.0],
+                    egui::TextEdit::singleline(&mut self.row_width_prompt_input)
+                        .hint_text(self.row_width_bits.to_string()),
+                );
+                if self.focus_row_width_prompt_input {
+                    response.request_focus();
+                    self.focus_row_width_prompt_input = false;
+                }
+                if response.changed() {
+                    self.row_width_prompt_feedback = None;
+                }
+
+                let submit =
+                    response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
+                let escape = ui.input(|input| input.key_pressed(Key::Escape));
+                if submit || ui.button("Apply").clicked() {
+                    if self.submit_row_width_prompt() {
+                        close_requested = true;
+                    }
+                } else if escape {
+                    close_requested = true;
+                }
+
+                if let Some(feedback) = self.row_width_prompt_feedback.as_ref() {
+                    self.show_command_feedback(ui, feedback);
+                }
+            });
+
+        self.show_row_width_prompt = show_row_width_prompt && !close_requested;
     }
 
     fn show_filter_help_window(&mut self, context: &Context) {
@@ -2271,39 +2468,58 @@ impl BitViewerApp {
                     .inner_margin(18),
             )
             .show(context, |ui| {
-                self.section_header(
-                    ui,
-                    "Filter Help",
-                    "Each filter changes the current view in order from top to bottom.",
-                );
+                ScrollArea::vertical()
+                    .id_salt("filter-help-scroll")
+                    .max_height(520.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.section_header(
+                            ui,
+                            "Filter Help",
+                            "Each filter changes the current view in order from top to bottom. The command line supports Tab completion for command names.",
+                        );
 
-                let filter_help_steps = [
-                    FilterStep::SyncOnPreamble {
-                        bits: String::new(),
-                    },
-                    FilterStep::Split { group_size_bits: 8 },
-                    FilterStep::Chop { bits: 0 },
-                    FilterStep::ReverseBitsPerByte,
-                    FilterStep::InvertBits,
-                    FilterStep::XorMask { mask: 0 },
-                    FilterStep::Flatten,
-                    FilterStep::KeepGroupsLongerThanBytes { min_bytes: 0 },
-                    FilterStep::SelectBitRangeFromGroup {
-                        start_bit: 0,
-                        length_bits: 0,
-                    },
-                    FilterStep::ExtractL2Packets {
-                        protocol: L2Protocol::Ethernet,
-                    },
-                ];
+                        let filter_help_steps = [
+                            FilterStep::SyncOnPreamble {
+                                bits: String::new(),
+                            },
+                            FilterStep::Split { group_size_bits: 8 },
+                            FilterStep::Chop { bits: 0 },
+                            FilterStep::ReverseBitsPerByte,
+                            FilterStep::InvertBits,
+                            FilterStep::XorMask { mask: 0 },
+                            FilterStep::Flatten,
+                            FilterStep::KeepGroupsLongerThanBytes { min_bytes: 0 },
+                            FilterStep::SelectBitRangeFromGroup {
+                                start_bit: 0,
+                                length_bits: 0,
+                            },
+                            FilterStep::ExtractL2Packets {
+                                protocol: L2Protocol::Ethernet,
+                            },
+                        ];
 
-                for step in filter_help_steps {
-                    self.compact_card_frame(SURFACE_ALT_BG).show(ui, |ui| {
-                        ui.label(RichText::new(step.label()).strong().color(TEXT_PRIMARY));
-                        ui.label(RichText::new(step.help_text()).small().color(TEXT_MUTED));
+                        for (spec, step) in filter_command_specs().iter().zip(filter_help_steps) {
+                            self.compact_card_frame(SURFACE_ALT_BG).show(ui, |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    self.compact_status_chip(ui, spec.name);
+                                    ui.monospace(spec.usage);
+                                });
+                                ui.add_space(4.0);
+                                ui.label(RichText::new(step.label()).strong().color(TEXT_PRIMARY));
+                                ui.label(RichText::new(spec.summary).small().color(TEXT_MUTED));
+                                if spec.example != spec.usage {
+                                    ui.label(
+                                        RichText::new(format!("Example: {}", spec.example))
+                                            .small()
+                                            .color(TEXT_MUTED),
+                                    );
+                                }
+                                ui.label(RichText::new(step.help_text()).small().color(TEXT_MUTED));
+                            });
+                            ui.add_space(6.0);
+                        }
                     });
-                    ui.add_space(6.0);
-                }
             });
         self.show_filter_help = show_filter_help;
     }
@@ -2419,8 +2635,19 @@ impl BitViewerApp {
                     .num_columns(2)
                     .spacing(egui::vec2(16.0, 10.0))
                     .show(ui, |ui| {
+                        ui.monospace("w");
+                        ui.label(RichText::new("Open the row-width prompt").color(TEXT_MUTED));
+                        ui.end_row();
+
+                        ui.monospace("f");
+                        ui.label(RichText::new("Open the filters window").color(TEXT_MUTED));
+                        ui.end_row();
+
                         ui.monospace("[ / ]");
-                        ui.label(RichText::new("Decrease / increase row width").color(TEXT_MUTED));
+                        ui.label(
+                            RichText::new("Decrease / increase row width by one bit")
+                                .color(TEXT_MUTED),
+                        );
                         ui.end_row();
 
                         ui.monospace("- / =");
@@ -2459,10 +2686,12 @@ impl BitViewerApp {
                     .num_columns(2)
                     .spacing(egui::vec2(16.0, 10.0))
                     .show(ui, |ui| {
+                        ui.monospace("Left-click drag in bit / hex / ASCII");
+                        ui.label(RichText::new("Paint highlighted columns").color(TEXT_MUTED));
+                        ui.end_row();
+
                         ui.monospace("Right-click drag in bit / hex / ASCII");
-                        ui.label(
-                            RichText::new("Draw or erase highlighted columns").color(TEXT_MUTED),
-                        );
+                        ui.label(RichText::new("Erase highlighted columns").color(TEXT_MUTED));
                         ui.end_row();
 
                         ui.monospace("Middle-click in bit / hex / ASCII");
@@ -3115,11 +3344,16 @@ impl BitViewerApp {
                     "Bit Grid",
                     &format!("{} bits per row", self.row_width_bits),
                 );
+                ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
 
                 let pane_height = ui.available_height();
                 let mut scroll_area = ScrollArea::both()
                     .id_salt("native-bit-scroll")
                     .auto_shrink([false, false])
+                    .scroll_source(egui::scroll_area::ScrollSource {
+                        drag: false,
+                        ..Default::default()
+                    })
                     .max_height(pane_height)
                     .min_scrolled_height(pane_height)
                     .wheel_scroll_multiplier(SCROLL_MULTIPLIER);
@@ -3200,16 +3434,21 @@ impl BitViewerApp {
                 });
                 observed_bit_scroll_row =
                     (output.state.offset.y / bit_row_height).floor().max(0.0) as usize;
+                let draw_rect = scroll_area_draw_rect(ui, output.inner_rect, output.content_size);
+                let scrollbar_rects =
+                    scroll_area_scrollbar_rects(ui, output.inner_rect, output.content_size);
                 self.handle_draw_input(
                     ui,
-                    output.inner_rect,
+                    output.id,
+                    draw_rect,
+                    scrollbar_rects.as_slice(),
                     DrawGranularity::Bit,
                     pointer_bit_col_in_bit_grid(
-                        output.inner_rect,
+                        draw_rect,
                         output.state.offset.x,
                         self.bit_size,
                         self.row_width_bits,
-                        ui.ctx().input(|input| input.pointer.interact_pos()),
+                        ui.ctx().input(|input| input.pointer.latest_pos()),
                     ),
                 );
                 self.sync_scroll_positions_on_middle_click(
@@ -3235,14 +3474,7 @@ impl BitViewerApp {
         hex_width: f32,
     ) -> usize {
         ui.set_min_height(available_height);
-        ui.spacing_mut().item_spacing = egui::vec2(VIEWER_PANEL_GAP, 0.0);
 
-        let total_width = ui.available_width();
-        let ascii_panel_width = ASCII_COLUMN_DEFAULT_WIDTH
-            .max(ASCII_COLUMN_MIN_WIDTH)
-            .min((total_width * 0.38).max(ASCII_COLUMN_MIN_WIDTH));
-        let hex_panel_width =
-            (total_width - ascii_panel_width - VIEWER_PANEL_GAP).max(HEX_COLUMN_MIN_WIDTH);
         let ascii_content_width = ASCII_COLUMN_MIN_WIDTH.max(text_pane_content_width(
             bytes_per_row,
             TextPaneKind::Ascii,
@@ -3251,163 +3483,189 @@ impl BitViewerApp {
         let mut hex_observed_row = self.current_text_scroll_row;
         let mut ascii_observed_row = self.current_text_scroll_row;
 
-        ui.horizontal(|ui| {
-            ui.allocate_ui_with_layout(
-                Vec2::new(hex_panel_width, available_height),
-                Layout::top_down(Align::Min),
-                |ui| {
-                    egui::Frame::new()
-                        .fill(SURFACE_BG)
-                        .stroke(Stroke::new(1.0, BORDER_COLOR))
-                        .corner_radius(CornerRadius::same(18))
-                        .inner_margin(egui::Margin::symmetric(14, 14))
-                        .show(ui, |ui| {
-                            self.viewer_pane_header(
-                                ui,
-                                "Hex",
-                                &format!("{bytes_per_row} bytes per row"),
-                            );
+        let max_ascii_panel_width =
+            (ui.available_width() - HEX_COLUMN_MIN_WIDTH).max(ASCII_COLUMN_MIN_WIDTH);
 
-                            let pane_height = ui.available_height();
-                            let pane_width = ui.available_width().max(hex_width);
-                            let scroll_area = ScrollArea::both()
-                                .id_salt("native-hex-scroll")
-                                .auto_shrink([false, false])
-                                .max_height(pane_height)
-                                .min_scrolled_height(pane_height)
-                                .wheel_scroll_multiplier(SCROLL_MULTIPLIER)
-                                .vertical_scroll_offset(
-                                    text_scroll_target_row as f32 * text_row_height,
-                                );
-                            let highlighted_byte_ranges = self.highlighted_byte_ranges();
+        egui::SidePanel::right("ascii-text-pane")
+            .resizable(true)
+            .show_separator_line(true)
+            .default_width(ASCII_COLUMN_DEFAULT_WIDTH)
+            .min_width(ASCII_COLUMN_MIN_WIDTH)
+            .max_width(max_ascii_panel_width)
+            .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(0, 0)))
+            .show_inside(ui, |ui| {
+                ui.set_min_height(available_height);
+                egui::Frame::new()
+                    .fill(SURFACE_BG)
+                    .stroke(Stroke::new(1.0, BORDER_COLOR))
+                    .corner_radius(CornerRadius::same(18))
+                    .inner_margin(egui::Margin::symmetric(14, 14))
+                    .show(ui, |ui| {
+                        self.viewer_pane_header(ui, "ASCII", "printable preview");
+                        ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
 
-                            let output = scroll_area.show_rows(
-                                ui,
-                                text_row_height,
-                                total_rows,
-                                |ui, row_range| {
-                                    let start = row_range.start.saturating_sub(TEXT_OVERSCAN_ROWS);
-                                    let end = (row_range.end + TEXT_OVERSCAN_ROWS).min(total_rows);
+                        let pane_height = ui.available_height();
+                        let pane_width = ui.available_width().max(ascii_content_width);
+                        let scroll_area = ScrollArea::both()
+                            .id_salt("native-ascii-scroll")
+                            .auto_shrink([false, false])
+                            .scroll_source(egui::scroll_area::ScrollSource {
+                                drag: false,
+                                ..Default::default()
+                            })
+                            .max_height(pane_height)
+                            .min_scrolled_height(pane_height)
+                            .wheel_scroll_multiplier(SCROLL_MULTIPLIER)
+                            .vertical_scroll_offset(
+                                text_scroll_target_row as f32 * text_row_height,
+                            );
+                        let highlighted_byte_ranges = self.highlighted_byte_ranges();
 
-                                    for (row_offset, row) in self
-                                        .text_rows(layout, start, end.saturating_sub(start))
-                                        .iter()
-                                        .enumerate()
-                                    {
-                                        paint_single_text_row(
-                                            ui,
-                                            &row.hex,
-                                            text_row_height,
-                                            pane_width.max(hex_width),
-                                            TEXT_PRIMARY,
-                                            start + row_offset,
-                                            TextPaneKind::Hex,
-                                            text_char_width,
-                                            highlighted_byte_ranges.as_slice(),
-                                        );
-                                    }
-                                },
-                            );
-                            hex_observed_row =
-                                (output.state.offset.y / text_row_height).floor().max(0.0) as usize;
-                            self.handle_draw_input(
-                                ui,
-                                output.inner_rect,
-                                DrawGranularity::Byte,
-                                pointer_byte_col_in_text_pane(
-                                    output.inner_rect,
-                                    output.state.offset.x,
-                                    bytes_per_row,
-                                    TextPaneKind::Hex,
-                                    text_char_width,
-                                    ui.ctx().input(|input| input.pointer.interact_pos()),
-                                ),
-                            );
-                            self.sync_scroll_positions_on_middle_click(
-                                ui,
-                                output.inner_rect,
-                                hex_observed_row,
-                            );
-                        });
-                },
-            );
+                        let output = scroll_area.show_rows(
+                            ui,
+                            text_row_height,
+                            total_rows,
+                            |ui, row_range| {
+                                let start = row_range.start.saturating_sub(TEXT_OVERSCAN_ROWS);
+                                let end = (row_range.end + TEXT_OVERSCAN_ROWS).min(total_rows);
 
-            ui.allocate_ui_with_layout(
-                Vec2::new(ascii_panel_width, available_height),
-                Layout::top_down(Align::Min),
-                |ui| {
-                    egui::Frame::new()
-                        .fill(SURFACE_BG)
-                        .stroke(Stroke::new(1.0, BORDER_COLOR))
-                        .corner_radius(CornerRadius::same(18))
-                        .inner_margin(egui::Margin::symmetric(14, 14))
-                        .show(ui, |ui| {
-                            self.viewer_pane_header(ui, "ASCII", "printable preview");
+                                for (row_offset, row) in self
+                                    .text_rows(layout, start, end.saturating_sub(start))
+                                    .iter()
+                                    .enumerate()
+                                {
+                                    paint_single_text_row(
+                                        ui,
+                                        &row.ascii,
+                                        text_row_height,
+                                        pane_width,
+                                        TEXT_PRIMARY,
+                                        start + row_offset,
+                                        TextPaneKind::Ascii,
+                                        text_char_width,
+                                        highlighted_byte_ranges.as_slice(),
+                                    );
+                                }
+                            },
+                        );
+                        ascii_observed_row =
+                            (output.state.offset.y / text_row_height).floor().max(0.0) as usize;
+                        let draw_rect =
+                            scroll_area_draw_rect(ui, output.inner_rect, output.content_size);
+                        let scrollbar_rects =
+                            scroll_area_scrollbar_rects(ui, output.inner_rect, output.content_size);
+                        self.handle_draw_input(
+                            ui,
+                            output.id,
+                            draw_rect,
+                            scrollbar_rects.as_slice(),
+                            DrawGranularity::Byte,
+                            pointer_byte_col_in_text_pane(
+                                draw_rect,
+                                output.state.offset.x,
+                                bytes_per_row,
+                                TextPaneKind::Ascii,
+                                text_char_width,
+                                ui.ctx().input(|input| input.pointer.latest_pos()),
+                            ),
+                        );
+                        self.sync_scroll_positions_on_middle_click(
+                            ui,
+                            output.inner_rect,
+                            ascii_observed_row,
+                        );
+                    });
+            });
 
-                            let pane_height = ui.available_height();
-                            let pane_width = ui.available_width().max(ascii_content_width);
-                            let scroll_area = ScrollArea::both()
-                                .id_salt("native-ascii-scroll")
-                                .auto_shrink([false, false])
-                                .max_height(pane_height)
-                                .min_scrolled_height(pane_height)
-                                .wheel_scroll_multiplier(SCROLL_MULTIPLIER)
-                                .vertical_scroll_offset(
-                                    text_scroll_target_row as f32 * text_row_height,
-                                );
-                            let highlighted_byte_ranges = self.highlighted_byte_ranges();
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(0, 0)))
+            .show_inside(ui, |ui| {
+                ui.set_min_height(available_height);
+                egui::Frame::new()
+                    .fill(SURFACE_BG)
+                    .stroke(Stroke::new(1.0, BORDER_COLOR))
+                    .corner_radius(CornerRadius::same(18))
+                    .inner_margin(egui::Margin::symmetric(14, 14))
+                    .show(ui, |ui| {
+                        self.viewer_pane_header(
+                            ui,
+                            "Hex",
+                            &format!("{bytes_per_row} bytes per row"),
+                        );
+                        ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
 
-                            let output = scroll_area.show_rows(
-                                ui,
-                                text_row_height,
-                                total_rows,
-                                |ui, row_range| {
-                                    let start = row_range.start.saturating_sub(TEXT_OVERSCAN_ROWS);
-                                    let end = (row_range.end + TEXT_OVERSCAN_ROWS).min(total_rows);
+                        let pane_height = ui.available_height();
+                        let pane_width = ui.available_width().max(hex_width);
+                        let scroll_area = ScrollArea::both()
+                            .id_salt("native-hex-scroll")
+                            .auto_shrink([false, false])
+                            .scroll_source(egui::scroll_area::ScrollSource {
+                                drag: false,
+                                ..Default::default()
+                            })
+                            .max_height(pane_height)
+                            .min_scrolled_height(pane_height)
+                            .wheel_scroll_multiplier(SCROLL_MULTIPLIER)
+                            .vertical_scroll_offset(
+                                text_scroll_target_row as f32 * text_row_height,
+                            );
+                        let highlighted_byte_ranges = self.highlighted_byte_ranges();
 
-                                    for (row_offset, row) in self
-                                        .text_rows(layout, start, end.saturating_sub(start))
-                                        .iter()
-                                        .enumerate()
-                                    {
-                                        paint_single_text_row(
-                                            ui,
-                                            &row.ascii,
-                                            text_row_height,
-                                            pane_width,
-                                            TEXT_PRIMARY,
-                                            start + row_offset,
-                                            TextPaneKind::Ascii,
-                                            text_char_width,
-                                            highlighted_byte_ranges.as_slice(),
-                                        );
-                                    }
-                                },
-                            );
-                            ascii_observed_row =
-                                (output.state.offset.y / text_row_height).floor().max(0.0) as usize;
-                            self.handle_draw_input(
-                                ui,
-                                output.inner_rect,
-                                DrawGranularity::Byte,
-                                pointer_byte_col_in_text_pane(
-                                    output.inner_rect,
-                                    output.state.offset.x,
-                                    bytes_per_row,
-                                    TextPaneKind::Ascii,
-                                    text_char_width,
-                                    ui.ctx().input(|input| input.pointer.interact_pos()),
-                                ),
-                            );
-                            self.sync_scroll_positions_on_middle_click(
-                                ui,
-                                output.inner_rect,
-                                ascii_observed_row,
-                            );
-                        });
-                },
-            );
-        });
+                        let output = scroll_area.show_rows(
+                            ui,
+                            text_row_height,
+                            total_rows,
+                            |ui, row_range| {
+                                let start = row_range.start.saturating_sub(TEXT_OVERSCAN_ROWS);
+                                let end = (row_range.end + TEXT_OVERSCAN_ROWS).min(total_rows);
+
+                                for (row_offset, row) in self
+                                    .text_rows(layout, start, end.saturating_sub(start))
+                                    .iter()
+                                    .enumerate()
+                                {
+                                    paint_single_text_row(
+                                        ui,
+                                        &row.hex,
+                                        text_row_height,
+                                        pane_width.max(hex_width),
+                                        TEXT_PRIMARY,
+                                        start + row_offset,
+                                        TextPaneKind::Hex,
+                                        text_char_width,
+                                        highlighted_byte_ranges.as_slice(),
+                                    );
+                                }
+                            },
+                        );
+                        hex_observed_row =
+                            (output.state.offset.y / text_row_height).floor().max(0.0) as usize;
+                        let draw_rect =
+                            scroll_area_draw_rect(ui, output.inner_rect, output.content_size);
+                        let scrollbar_rects =
+                            scroll_area_scrollbar_rects(ui, output.inner_rect, output.content_size);
+                        self.handle_draw_input(
+                            ui,
+                            output.id,
+                            draw_rect,
+                            scrollbar_rects.as_slice(),
+                            DrawGranularity::Byte,
+                            pointer_byte_col_in_text_pane(
+                                draw_rect,
+                                output.state.offset.x,
+                                bytes_per_row,
+                                TextPaneKind::Hex,
+                                text_char_width,
+                                ui.ctx().input(|input| input.pointer.latest_pos()),
+                            ),
+                        );
+                        self.sync_scroll_positions_on_middle_click(
+                            ui,
+                            output.inner_rect,
+                            hex_observed_row,
+                        );
+                    });
+            });
 
         if hex_observed_row != text_scroll_target_row {
             hex_observed_row
@@ -3690,7 +3948,10 @@ impl BitViewerApp {
                 self.rebuild_rx = None;
                 self.rebuild_pending = false;
                 match build_result.result {
-                    Ok(view) => {
+                    Ok(cached_state) => {
+                        let view = cached_state.to_derived_view();
+                        self.cached_filter_state = Some(cached_state);
+                        self.cached_filter_pipeline = Some(self.pipeline.clone());
                         self.derived_view = Some(view);
                         self.derived_view_revision = self.derived_view_revision.saturating_add(1);
                         self.invalidate_render_caches();
@@ -3781,18 +4042,44 @@ impl BitViewerApp {
         }
     }
 
+    fn appended_filter_from_cache(&self) -> Option<FilterStep> {
+        let cached_pipeline = self.cached_filter_pipeline.as_ref()?;
+        let _cached_state = self.cached_filter_state.as_ref()?;
+        if self.pipeline.steps.len() != cached_pipeline.steps.len().saturating_add(1) {
+            return None;
+        }
+        if !self.pipeline.steps.starts_with(&cached_pipeline.steps) {
+            return None;
+        }
+        self.pipeline.steps.last().cloned()
+    }
+
     fn schedule_rebuild(&mut self) {
         let Some(document) = &self.document else {
             self.derived_view = None;
+            self.cached_filter_state = None;
+            self.cached_filter_pipeline = None;
             self.clear_autocorrelation_state();
             self.clear_run_histogram_state();
             return;
         };
 
-        let path = document.path().to_path_buf();
         let pipeline = self.pipeline.clone();
         let request_id = self.rebuild_request_id.saturating_add(1);
         let (sender, receiver) = mpsc::channel();
+        let rebuild_mode = self.appended_filter_from_cache().map_or_else(
+            || RebuildMode::Full {
+                path: document.path().to_path_buf(),
+                pipeline: pipeline.clone(),
+            },
+            |step| RebuildMode::AppendLast {
+                cached_state: self
+                    .cached_filter_state
+                    .clone()
+                    .expect("append rebuild requires a cached filter state"),
+                step,
+            },
+        );
 
         self.rebuild_request_id = request_id;
         self.rebuild_rx = Some(receiver);
@@ -3810,8 +4097,13 @@ impl BitViewerApp {
         self.last_export_message = None;
 
         thread::spawn(move || {
-            let result = BinaryDocument::open(&path)
-                .and_then(|document| document.build_derived_view(&pipeline));
+            let result = match rebuild_mode {
+                RebuildMode::Full { path, pipeline } => BinaryDocument::open(&path)
+                    .and_then(|document| document.build_cached_filter_state(&pipeline)),
+                RebuildMode::AppendLast { cached_state, step } => {
+                    append_filter_to_cached_state(&cached_state, &step)
+                }
+            };
             let _ = sender.send(DerivedBuildResult { request_id, result });
         });
     }
@@ -3845,6 +4137,8 @@ impl BitViewerApp {
             Ok(document) => {
                 self.path_input = document.path().display().to_string();
                 self.document = Some(document);
+                self.cached_filter_state = None;
+                self.cached_filter_pipeline = None;
                 self.schedule_rebuild();
             }
             Err(error) => {
@@ -3905,6 +4199,14 @@ impl BitViewerApp {
         }
 
         context.input(|input| {
+            if input.key_pressed(Key::W) {
+                self.open_row_width_prompt();
+            }
+
+            if input.key_pressed(Key::F) {
+                self.open_filters_window();
+            }
+
             if input.key_pressed(Key::H) {
                 self.show_text_pane = !self.show_text_pane;
             }
@@ -3928,6 +4230,71 @@ impl BitViewerApp {
         });
 
         self.handle_keyboard_navigation(context);
+    }
+
+    fn open_filters_window(&mut self) {
+        self.show_filters_window = true;
+        self.focus_filter_command_input = true;
+        self.filter_command_feedback = None;
+    }
+
+    fn open_row_width_prompt(&mut self) {
+        self.show_row_width_prompt = true;
+        self.row_width_prompt_input.clear();
+        self.row_width_prompt_feedback = None;
+        self.focus_row_width_prompt_input = true;
+    }
+
+    fn submit_filter_command(&mut self) -> bool {
+        match parse_filter_command(&self.filter_command_input) {
+            Ok(step) => {
+                let label = step.label().to_owned();
+                self.pipeline.steps.push(step);
+                self.filter_command_input.clear();
+                self.filter_command_feedback = Some(CommandFeedback {
+                    message: format!("Added {label}."),
+                    is_error: false,
+                });
+                self.focus_filter_command_input = true;
+                true
+            }
+            Err(message) => {
+                self.filter_command_feedback = Some(CommandFeedback {
+                    message,
+                    is_error: true,
+                });
+                self.focus_filter_command_input = true;
+                false
+            }
+        }
+    }
+
+    fn submit_row_width_prompt(&mut self) -> bool {
+        let trimmed = self.row_width_prompt_input.trim();
+        if trimmed.is_empty() {
+            self.row_width_prompt_feedback = Some(CommandFeedback {
+                message: "Type a row width in bits.".to_owned(),
+                is_error: true,
+            });
+            self.focus_row_width_prompt_input = true;
+            return false;
+        }
+
+        match trimmed.parse::<usize>() {
+            Ok(width_bits) => {
+                self.set_row_width_immediately(width_bits);
+                self.row_width_prompt_feedback = None;
+                true
+            }
+            Err(_) => {
+                self.row_width_prompt_feedback = Some(CommandFeedback {
+                    message: format!("`{trimmed}` is not a valid row width."),
+                    is_error: true,
+                });
+                self.focus_row_width_prompt_input = true;
+                false
+            }
+        }
     }
 
     fn handle_keyboard_navigation(&mut self, context: &Context) {
@@ -4864,9 +5231,58 @@ fn paint_column_drag_overlay(
         ui.painter().rect_filled(
             highlight_rect,
             CornerRadius::ZERO,
-            ACCENT_SOFT.linear_multiply(0.35),
+            HIGHLIGHT_COLOR.linear_multiply(0.55),
         );
     }
+}
+
+fn scroll_area_draw_rect(ui: &Ui, inner_rect: Rect, content_size: Vec2) -> Rect {
+    let mut draw_rect = Rect::from_min_size(
+        inner_rect.min,
+        Vec2::new(
+            content_size.x.min(inner_rect.width()),
+            content_size.y.min(inner_rect.height()),
+        ),
+    );
+    let scroll_style = ui.spacing().scroll;
+    let reserved = scroll_style.bar_width + scroll_style.bar_outer_margin;
+
+    if content_size.x > inner_rect.width() {
+        draw_rect.max.y = (draw_rect.max.y - reserved).max(draw_rect.min.y);
+    }
+    if content_size.y > inner_rect.height() {
+        draw_rect.max.x = (draw_rect.max.x - reserved).max(draw_rect.min.x);
+    }
+
+    draw_rect
+}
+
+fn scroll_area_scrollbar_rects(ui: &Ui, inner_rect: Rect, content_size: Vec2) -> Vec<Rect> {
+    let scroll_style = ui.spacing().scroll;
+    let reserved = scroll_style.bar_width + scroll_style.bar_outer_margin;
+    let mut rects = Vec::with_capacity(2);
+
+    if content_size.x > inner_rect.width() {
+        rects.push(Rect::from_min_max(
+            egui::pos2(
+                inner_rect.left(),
+                (inner_rect.bottom() - reserved).max(inner_rect.top()),
+            ),
+            inner_rect.right_bottom(),
+        ));
+    }
+
+    if content_size.y > inner_rect.height() {
+        rects.push(Rect::from_min_max(
+            egui::pos2(
+                (inner_rect.right() - reserved).max(inner_rect.left()),
+                inner_rect.top(),
+            ),
+            inner_rect.right_bottom(),
+        ));
+    }
+
+    rects
 }
 
 fn pointer_bit_col_in_bit_grid(
@@ -4967,7 +5383,7 @@ fn paint_text_column_overlay(
         ui.painter().rect_filled(
             highlight_rect,
             CornerRadius::ZERO,
-            ACCENT_SOFT.linear_multiply(0.45),
+            HIGHLIGHT_COLOR.linear_multiply(0.6),
         );
     }
 }
@@ -5019,6 +5435,27 @@ mod tests {
         app.apply_draw_segment(DrawGranularity::Byte, 1, 1, super::DrawStrokeMode::Erase);
 
         assert_eq!(app.highlighted_bit_ranges(), vec![(0, 8)]);
+    }
+
+    #[test]
+    fn draw_stroke_mode_is_explicit() {
+        let mut app = BitViewerApp::default();
+        app.row_width_bits = 8;
+        app.drawn_bit_columns.insert(3);
+
+        app.start_draw_stroke(DrawGranularity::Bit, 3, super::DrawStrokeMode::Paint);
+        assert!(app.drawn_bit_columns.contains(&3));
+        assert_eq!(
+            app.active_draw_stroke.map(|stroke| stroke.mode),
+            Some(super::DrawStrokeMode::Paint)
+        );
+
+        app.start_draw_stroke(DrawGranularity::Bit, 3, super::DrawStrokeMode::Erase);
+        assert!(!app.drawn_bit_columns.contains(&3));
+        assert_eq!(
+            app.active_draw_stroke.map(|stroke| stroke.mode),
+            Some(super::DrawStrokeMode::Erase)
+        );
     }
 
     #[test]
@@ -5089,6 +5526,16 @@ mod tests {
         assert_eq!(app.row_width_bits, 1);
         assert_eq!(app.target_row_width_bits, 1);
         assert_eq!(app.row_width_input, "1");
+    }
+
+    #[test]
+    fn row_width_prompt_applies_keyboard_value() {
+        let mut app = BitViewerApp::default();
+        app.row_width_prompt_input = "256".to_owned();
+
+        assert!(app.submit_row_width_prompt());
+        assert_eq!(app.row_width_bits, 256);
+        assert_eq!(app.target_row_width_bits, 256);
     }
 
     #[test]

@@ -6,7 +6,8 @@ use memmap2::{Mmap, MmapOptions};
 use pcap_file::pcap::PcapReader;
 
 use crate::filters::{
-    DerivedView, FilterPipeline, build_derived_view, build_derived_view_from_groups,
+    CachedFilterState, DerivedView, FilterPipeline, build_cached_filter_state,
+    build_cached_filter_state_from_groups, build_derived_view, build_derived_view_from_groups,
 };
 
 const PCAP_MAGIC_NUMBERS: [[u8; 4]; 4] = [
@@ -79,11 +80,24 @@ impl BinaryDocument {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn build_derived_view(&self, pipeline: &FilterPipeline) -> Result<DerivedView, String> {
         match &self.source {
             DocumentSource::Bytes(mmap) => build_derived_view(mmap, pipeline),
             DocumentSource::PacketGroups(groups) => {
                 build_derived_view_from_groups(groups, pipeline)
+            }
+        }
+    }
+
+    pub fn build_cached_filter_state(
+        &self,
+        pipeline: &FilterPipeline,
+    ) -> Result<CachedFilterState, String> {
+        match &self.source {
+            DocumentSource::Bytes(mmap) => build_cached_filter_state(mmap, pipeline),
+            DocumentSource::PacketGroups(groups) => {
+                build_cached_filter_state_from_groups(groups, pipeline)
             }
         }
     }

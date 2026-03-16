@@ -143,6 +143,370 @@ impl FilterStep {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FilterCommandSpec {
+    pub name: &'static str,
+    pub usage: &'static str,
+    pub summary: &'static str,
+    pub example: &'static str,
+}
+
+const FILTER_COMMAND_SPECS: [FilterCommandSpec; 10] = [
+    FilterCommandSpec {
+        name: "sync",
+        usage: "sync <bits>",
+        summary: "Split the stream into groups on a preamble bit pattern.",
+        example: "sync 1010",
+    },
+    FilterCommandSpec {
+        name: "split",
+        usage: "split <group_size_bits>",
+        summary: "Cut the flattened stream into fixed-size groups.",
+        example: "split 256",
+    },
+    FilterCommandSpec {
+        name: "chop",
+        usage: "chop <bits>",
+        summary: "Remove bits from the start of the file or each group.",
+        example: "chop 8",
+    },
+    FilterCommandSpec {
+        name: "reverse",
+        usage: "reverse",
+        summary: "Reverse bit order inside each byte.",
+        example: "reverse",
+    },
+    FilterCommandSpec {
+        name: "invert",
+        usage: "invert",
+        summary: "Flip every bit in the current view.",
+        example: "invert",
+    },
+    FilterCommandSpec {
+        name: "xor",
+        usage: "xor <mask>",
+        summary: "XOR every byte with a mask.",
+        example: "xor 0xff",
+    },
+    FilterCommandSpec {
+        name: "flatten",
+        usage: "flatten",
+        summary: "Merge all groups back into one continuous stream.",
+        example: "flatten",
+    },
+    FilterCommandSpec {
+        name: "keep",
+        usage: "keep <min_bytes>",
+        summary: "Keep only groups longer than the given byte threshold.",
+        example: "keep 6",
+    },
+    FilterCommandSpec {
+        name: "select",
+        usage: "select <start_bit> <length_bits>",
+        summary: "Keep a fixed bit range from each group.",
+        example: "select 0 48",
+    },
+    FilterCommandSpec {
+        name: "extract",
+        usage: "extract <ethernet|ppp|ppp-hdlc|hdlc|sdlc|cisco-hdlc>",
+        summary: "Split the stream into L2 packets for a protocol.",
+        example: "extract ethernet",
+    },
+];
+
+pub fn filter_command_specs() -> &'static [FilterCommandSpec] {
+    &FILTER_COMMAND_SPECS
+}
+
+pub fn filter_command_suggestions(input: &str) -> Vec<&'static FilterCommandSpec> {
+    let query = input.trim().to_ascii_lowercase();
+    filter_command_specs()
+        .iter()
+        .enumerate()
+        .filter(|(index, spec)| {
+            query.is_empty()
+                || spec.name.contains(&query)
+                || spec.usage.contains(&query)
+                || spec.example.contains(&query)
+                || filter_command_aliases(*index)
+                    .iter()
+                    .any(|alias| alias.contains(&query))
+        })
+        .map(|(_, spec)| spec)
+        .collect()
+}
+
+pub fn complete_filter_command(input: &str) -> Option<String> {
+    let trimmed_start = input.trim_start();
+    if trimmed_start.is_empty() {
+        return None;
+    }
+
+    let leading_whitespace = &input[..input.len().saturating_sub(trimmed_start.len())];
+    let (command_fragment, remainder) = trimmed_start
+        .split_once(char::is_whitespace)
+        .map_or((trimmed_start, ""), |(command, tail)| (command, tail));
+
+    if !remainder.trim().is_empty() {
+        return None;
+    }
+
+    let normalized_fragment = command_fragment.to_ascii_lowercase();
+    let mut matches = filter_command_specs()
+        .iter()
+        .enumerate()
+        .filter(|(index, spec)| {
+            spec.name.starts_with(&normalized_fragment)
+                || filter_command_aliases(*index)
+                    .iter()
+                    .any(|alias| alias.starts_with(&normalized_fragment))
+        })
+        .map(|(_, spec)| spec.name)
+        .collect::<Vec<_>>();
+
+    matches.sort_unstable();
+    matches.dedup();
+
+    if matches.len() != 1 {
+        return None;
+    }
+
+    Some(format!("{leading_whitespace}{} ", matches[0]))
+}
+
+pub fn parse_filter_command(input: &str) -> Result<FilterStep, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("Type a filter command such as `split 256` or `chop 8`.".to_owned());
+    }
+
+    for (index, _) in FILTER_COMMAND_SPECS.iter().enumerate() {
+        if let Some(arguments) = split_command_prefix(trimmed, filter_command_aliases(index)) {
+            return parse_filter_command_with_index(index, arguments);
+        }
+    }
+
+    let known = filter_command_specs()
+        .iter()
+        .map(|spec| spec.name)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!("Unknown filter command. Try one of: {known}."))
+}
+
+fn filter_command_aliases(index: usize) -> &'static [&'static str] {
+    match index {
+        0 => &["sync-on-preamble", "sync-preamble", "preamble", "sync"],
+        1 => &["split"],
+        2 => &["chop"],
+        3 => &[
+            "reverse-bits-per-byte",
+            "reverse-bits",
+            "reverse-bytes",
+            "reverse",
+        ],
+        4 => &["invert-bits", "invert"],
+        5 => &["xor-mask", "mask", "xor"],
+        6 => &["flatten-groups", "flatten"],
+        7 => &[
+            "keep-groups-longer-than-bytes",
+            "keep-groups",
+            "keep-groups-bytes",
+            "keep",
+        ],
+        8 => &["select-range", "select-bit-range", "range", "select"],
+        9 => &["extract-l2", "extract-packets", "packets", "l2", "extract"],
+        _ => &[],
+    }
+}
+
+fn split_command_prefix<'a>(input: &'a str, aliases: &[&str]) -> Option<&'a str> {
+    let trimmed = input.trim_start();
+    for alias in aliases {
+        let Some((candidate, tail)) = trimmed.split_at_checked(alias.len()) else {
+            continue;
+        };
+        if !candidate.eq_ignore_ascii_case(alias) {
+            continue;
+        }
+        if tail.is_empty() || tail.starts_with(char::is_whitespace) {
+            return Some(tail.trim_start());
+        }
+    }
+    None
+}
+
+fn parse_filter_command_with_index(index: usize, arguments: &str) -> Result<FilterStep, String> {
+    match index {
+        0 => {
+            let bits = if arguments.is_empty() {
+                "1010".to_owned()
+            } else {
+                arguments.to_owned()
+            };
+            parse_preamble_bits(&bits)?;
+            Ok(FilterStep::SyncOnPreamble { bits })
+        }
+        1 => Ok(FilterStep::Split {
+            group_size_bits: parse_required_positive_usize(arguments, "split", 8)?,
+        }),
+        2 => Ok(FilterStep::Chop {
+            bits: parse_optional_usize(arguments, "chop", 8)?,
+        }),
+        3 => {
+            reject_extra_arguments(arguments, "reverse")?;
+            Ok(FilterStep::ReverseBitsPerByte)
+        }
+        4 => {
+            reject_extra_arguments(arguments, "invert")?;
+            Ok(FilterStep::InvertBits)
+        }
+        5 => Ok(FilterStep::XorMask {
+            mask: parse_optional_u8(arguments, "xor", 0xFF)?,
+        }),
+        6 => {
+            reject_extra_arguments(arguments, "flatten")?;
+            Ok(FilterStep::Flatten)
+        }
+        7 => Ok(FilterStep::KeepGroupsLongerThanBytes {
+            min_bytes: parse_optional_usize(arguments, "keep", 6)?,
+        }),
+        8 => {
+            let [start_bit, length_bits] = parse_usize_list(arguments, "select", &[0, 48])?
+                .try_into()
+                .expect("select should produce exactly two values");
+            Ok(FilterStep::SelectBitRangeFromGroup {
+                start_bit,
+                length_bits,
+            })
+        }
+        9 => Ok(FilterStep::ExtractL2Packets {
+            protocol: parse_l2_protocol(arguments)?,
+        }),
+        _ => Err("Unknown filter command.".to_owned()),
+    }
+}
+
+fn reject_extra_arguments(arguments: &str, command: &str) -> Result<(), String> {
+    if arguments.trim().is_empty() {
+        Ok(())
+    } else {
+        Err(format!("`{command}` does not take any parameters."))
+    }
+}
+
+fn parse_required_positive_usize(
+    arguments: &str,
+    command: &str,
+    default: usize,
+) -> Result<usize, String> {
+    let value = parse_optional_usize(arguments, command, default)?;
+    if value == 0 {
+        Err(format!("`{command}` requires a value greater than zero."))
+    } else {
+        Ok(value)
+    }
+}
+
+fn parse_optional_usize(arguments: &str, command: &str, default: usize) -> Result<usize, String> {
+    if arguments.trim().is_empty() {
+        return Ok(default);
+    }
+
+    let values = parse_usize_list(arguments, command, &[])?;
+    if values.len() != 1 {
+        return Err(format!(
+            "`{command}` expects exactly one numeric parameter."
+        ));
+    }
+    Ok(values[0])
+}
+
+fn parse_optional_u8(arguments: &str, command: &str, default: u8) -> Result<u8, String> {
+    if arguments.trim().is_empty() {
+        return Ok(default);
+    }
+
+    let parts = split_numeric_arguments(arguments);
+    if parts.len() != 1 {
+        return Err(format!(
+            "`{command}` expects exactly one numeric parameter."
+        ));
+    }
+    parse_u8_token(parts[0], command)
+}
+
+fn parse_usize_list(
+    arguments: &str,
+    command: &str,
+    default: &[usize],
+) -> Result<Vec<usize>, String> {
+    if arguments.trim().is_empty() {
+        return Ok(default.to_vec());
+    }
+
+    split_numeric_arguments(arguments)
+        .into_iter()
+        .map(|part| parse_usize_token(part, command))
+        .collect()
+}
+
+fn split_numeric_arguments(arguments: &str) -> Vec<&str> {
+    arguments
+        .split(|character: char| character.is_whitespace() || matches!(character, ',' | ':'))
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
+fn parse_usize_token(token: &str, command: &str) -> Result<usize, String> {
+    if let Some(hex) = token
+        .strip_prefix("0x")
+        .or_else(|| token.strip_prefix("0X"))
+    {
+        usize::from_str_radix(hex, 16)
+            .map_err(|_| format!("`{command}` expects a valid number, got `{token}`."))
+    } else {
+        token
+            .parse::<usize>()
+            .map_err(|_| format!("`{command}` expects a valid number, got `{token}`."))
+    }
+}
+
+fn parse_u8_token(token: &str, command: &str) -> Result<u8, String> {
+    if let Some(hex) = token
+        .strip_prefix("0x")
+        .or_else(|| token.strip_prefix("0X"))
+    {
+        u8::from_str_radix(hex, 16)
+            .map_err(|_| format!("`{command}` expects a byte-sized number, got `{token}`."))
+    } else {
+        token
+            .parse::<u8>()
+            .map_err(|_| format!("`{command}` expects a byte-sized number, got `{token}`."))
+    }
+}
+
+fn parse_l2_protocol(arguments: &str) -> Result<L2Protocol, String> {
+    let normalized = arguments
+        .trim()
+        .to_ascii_lowercase()
+        .replace('_', "-")
+        .replace(' ', "-");
+
+    match normalized.as_str() {
+        "" | "ethernet" | "eth" => Ok(L2Protocol::Ethernet),
+        "ppp" | "ppp-async" | "async-ppp" => Ok(L2Protocol::PppAsync),
+        "ppp-hdlc" | "ppp-hdlc-like" | "ppp-like" => Ok(L2Protocol::PppHdlcLike),
+        "hdlc" => Ok(L2Protocol::Hdlc),
+        "sdlc" => Ok(L2Protocol::Sdlc),
+        "cisco-hdlc" | "chdlc" => Ok(L2Protocol::CiscoHdlc),
+        _ => Err(
+            "Unknown L2 protocol. Try ethernet, ppp, ppp-hdlc, hdlc, sdlc, or cisco-hdlc."
+                .to_owned(),
+        ),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DerivedGroup {
     data: BitBuffer,
@@ -326,6 +690,7 @@ impl BitBuffer {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum PipelineState {
     Flat(BitBuffer),
     Grouped(Vec<BitBuffer>),
@@ -352,29 +717,69 @@ impl PipelineState {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn build_derived_view(bytes: &[u8], pipeline: &FilterPipeline) -> Result<DerivedView, String> {
-    build_derived_view_from_state(
+    build_cached_filter_state(bytes, pipeline).map(|state| state.to_derived_view())
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn build_derived_view_from_groups(
+    groups: &[Vec<u8>],
+    pipeline: &FilterPipeline,
+) -> Result<DerivedView, String> {
+    build_cached_filter_state_from_groups(groups, pipeline).map(|state| state.to_derived_view())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CachedFilterState {
+    state: PipelineState,
+}
+
+impl CachedFilterState {
+    pub fn to_derived_view(&self) -> DerivedView {
+        build_derived_view_from_state(self.state.clone())
+    }
+}
+
+pub fn build_cached_filter_state(
+    bytes: &[u8],
+    pipeline: &FilterPipeline,
+) -> Result<CachedFilterState, String> {
+    build_cached_filter_state_from_state(
         PipelineState::Flat(BitBuffer::from_bytes(bytes.to_vec())),
         pipeline,
     )
 }
 
-pub fn build_derived_view_from_groups(
+pub fn build_cached_filter_state_from_groups(
     groups: &[Vec<u8>],
     pipeline: &FilterPipeline,
-) -> Result<DerivedView, String> {
+) -> Result<CachedFilterState, String> {
     let state = PipelineState::Grouped(groups.iter().cloned().map(BitBuffer::from_bytes).collect());
-    build_derived_view_from_state(state, pipeline)
+    build_cached_filter_state_from_state(state, pipeline)
 }
 
-fn build_derived_view_from_state(
+pub fn append_filter_to_cached_state(
+    cached_state: &CachedFilterState,
+    step: &FilterStep,
+) -> Result<CachedFilterState, String> {
+    Ok(CachedFilterState {
+        state: apply_step(cached_state.state.clone(), step)?,
+    })
+}
+
+fn build_cached_filter_state_from_state(
     mut state: PipelineState,
     pipeline: &FilterPipeline,
-) -> Result<DerivedView, String> {
+) -> Result<CachedFilterState, String> {
     for step in &pipeline.steps {
         state = apply_step(state, step)?;
     }
 
+    Ok(CachedFilterState { state })
+}
+
+fn build_derived_view_from_state(state: PipelineState) -> DerivedView {
     let groups = match state {
         PipelineState::Flat(buffer) => {
             if buffer.is_empty() {
@@ -390,7 +795,7 @@ fn build_derived_view_from_state(
             .collect(),
     };
 
-    Ok(DerivedView::new(groups))
+    DerivedView::new(groups)
 }
 
 fn apply_step(state: PipelineState, step: &FilterStep) -> Result<PipelineState, String> {
@@ -928,8 +1333,8 @@ fn mask_unused_tail_bits(bytes: &mut [u8], bit_len: usize) {
 #[cfg(test)]
 mod tests {
     use super::{
-        DerivedView, FilterPipeline, FilterStep, L2Protocol, build_derived_view,
-        parse_preamble_bits,
+        DerivedView, FilterPipeline, FilterStep, L2Protocol, append_filter_to_cached_state,
+        build_cached_filter_state, build_derived_view, parse_preamble_bits,
     };
 
     fn group_bits(view: &DerivedView) -> Vec<Vec<u8>> {
@@ -1210,10 +1615,112 @@ mod tests {
     }
 
     #[test]
+    fn append_filter_to_cached_state_matches_full_rebuild() {
+        let bytes = [0b1010_0001, 0b1010_1111, 0b1010_0010];
+        let base_pipeline = FilterPipeline {
+            steps: vec![FilterStep::SyncOnPreamble {
+                bits: "1010".to_owned(),
+            }],
+        };
+        let appended_step = FilterStep::SelectBitRangeFromGroup {
+            start_bit: 0,
+            length_bits: 4,
+        };
+        let full_pipeline = FilterPipeline {
+            steps: vec![base_pipeline.steps[0].clone(), appended_step.clone()],
+        };
+
+        let cached_state =
+            build_cached_filter_state(&bytes, &base_pipeline).expect("base pipeline should work");
+        let appended_state = append_filter_to_cached_state(&cached_state, &appended_step)
+            .expect("appending the final step should work");
+        let full_state =
+            build_cached_filter_state(&bytes, &full_pipeline).expect("full pipeline should work");
+
+        assert_eq!(appended_state, full_state);
+        assert_eq!(
+            appended_state.to_derived_view(),
+            build_derived_view(&bytes, &full_pipeline).expect("full view should build")
+        );
+    }
+
+    #[test]
+    fn cached_state_preserves_flat_state_for_group_only_filters() {
+        let bytes = [0b1111_0000];
+        let cached_state =
+            build_cached_filter_state(&bytes, &FilterPipeline::default()).expect("base view");
+        let error = append_filter_to_cached_state(
+            &cached_state,
+            &FilterStep::KeepGroupsLongerThanBytes { min_bytes: 1 },
+        )
+        .expect_err("group-only filter should still reject flat cached input");
+
+        assert!(error.contains("requires a grouping step"));
+    }
+
+    #[test]
     fn parse_preamble_bits_accepts_hex_input() {
         let bits = parse_preamble_bits("0xA5").expect("hex preamble should parse");
 
         assert_eq!(bits, vec![1, 0, 1, 0, 0, 1, 0, 1]);
+    }
+
+    #[test]
+    fn parse_filter_command_accepts_parameters_and_defaults() {
+        assert_eq!(
+            super::parse_filter_command("split 256").expect("split should parse"),
+            FilterStep::Split {
+                group_size_bits: 256,
+            }
+        );
+        assert_eq!(
+            super::parse_filter_command("chop").expect("chop should use its default"),
+            FilterStep::Chop { bits: 8 }
+        );
+        assert_eq!(
+            super::parse_filter_command("select 12, 24").expect("select should parse two values"),
+            FilterStep::SelectBitRangeFromGroup {
+                start_bit: 12,
+                length_bits: 24,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_filter_command_accepts_protocol_and_mask_aliases() {
+        assert_eq!(
+            super::parse_filter_command("xor 0xaa").expect("xor should parse hex masks"),
+            FilterStep::XorMask { mask: 0xAA }
+        );
+        assert_eq!(
+            super::parse_filter_command("extract cisco hdlc")
+                .expect("extract should parse protocol aliases"),
+            FilterStep::ExtractL2Packets {
+                protocol: L2Protocol::CiscoHdlc,
+            }
+        );
+    }
+
+    #[test]
+    fn complete_filter_command_completes_unique_prefixes() {
+        assert_eq!(
+            super::complete_filter_command("sp"),
+            Some("split ".to_owned())
+        );
+        assert_eq!(
+            super::complete_filter_command("pre"),
+            Some("sync ".to_owned())
+        );
+        assert_eq!(super::complete_filter_command("s"), None);
+        assert_eq!(super::complete_filter_command("split 256"), None);
+    }
+
+    #[test]
+    fn parse_filter_command_rejects_unknown_commands() {
+        let error =
+            super::parse_filter_command("unknown 1").expect_err("unknown filter should fail");
+
+        assert!(error.contains("Unknown filter command"));
     }
 
     #[test]
