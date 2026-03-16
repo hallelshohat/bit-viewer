@@ -621,6 +621,14 @@ impl BitViewerApp {
         self.autocorrelation_graph_viewport.reset();
     }
 
+    fn invalidate_autocorrelation_analysis(&mut self) {
+        self.autocorrelation_result = None;
+        self.autocorrelation_rx = None;
+        self.autocorrelation_pending = false;
+        self.autocorrelation_progress = None;
+        self.autocorrelation_progress_total = 0;
+    }
+
     fn suspend_run_histogram_worker(&mut self) {
         if let Some(cancel) = self.run_histogram_cancel.take() {
             cancel.store(true, Ordering::Relaxed);
@@ -690,6 +698,17 @@ impl BitViewerApp {
             .unwrap_or(0);
         let fraction = completed as f32 / total as f32;
         Some((completed, total, fraction))
+    }
+
+    fn ensure_autocorrelation(&mut self) {
+        if !self.show_autocorrelation_panel
+            || self.autocorrelation_pending
+            || self.autocorrelation_result.is_some()
+        {
+            return;
+        }
+
+        self.schedule_autocorrelation();
     }
 
     fn ensure_run_histogram(&mut self) {
@@ -812,8 +831,10 @@ impl BitViewerApp {
 
     fn finish_active_draw_stroke_on_release(&mut self, context: &Context) {
         if self.active_draw_stroke.is_some()
-            && !context
-                .input(|input| input.pointer.primary_down() || input.pointer.secondary_down())
+            && !context.input(|input| {
+                draw_modifier_active(input.modifiers)
+                    && (input.pointer.primary_down() || input.pointer.secondary_down())
+            })
         {
             self.active_draw_stroke = None;
         }
@@ -1012,6 +1033,7 @@ impl BitViewerApp {
             primary_down,
             secondary_pressed,
             secondary_down,
+            modifiers,
         ) = ui.ctx().input(|input| {
             (
                 input.pointer.latest_pos(),
@@ -1020,8 +1042,13 @@ impl BitViewerApp {
                 input.pointer.primary_down(),
                 input.pointer.secondary_pressed(),
                 input.pointer.secondary_down(),
+                input.modifiers,
             )
         });
+
+        if !draw_modifier_active(modifiers) {
+            return;
+        }
 
         let mode = match (primary_down, secondary_down) {
             (true, false) => DrawStrokeMode::Paint,
@@ -1436,6 +1463,7 @@ impl BitViewerApp {
             .clicked()
         {
             self.show_autocorrelation_panel = true;
+            self.ensure_autocorrelation();
         }
 
         let button_label = if self.show_run_histogram_panel {
@@ -1579,8 +1607,8 @@ impl BitViewerApp {
         ui.monospace("- / =  bit size");
         ui.monospace("h      toggle text pane");
         ui.monospace("Home / End / PgUp / PgDn  navigation");
-        ui.monospace("Left-click drag in a pane   paint highlight");
-        ui.monospace("Right-click drag in a pane  erase highlight");
+        ui.monospace("Ctrl + left-drag in a pane   paint highlight");
+        ui.monospace("Ctrl + right-drag in a pane  erase highlight");
         ui.monospace("Middle-click in a pane      align all scroll positions");
     }
 
@@ -1802,7 +1830,7 @@ impl BitViewerApp {
                                 ui.add_space(28.0);
                                 ui.label(
                                     RichText::new(
-                                        "No autocorrelation data is available for this view.",
+                                        "Open the pane with a loaded view to compute autocorrelation.",
                                     )
                                     .small()
                                     .color(TEXT_MUTED),
@@ -1826,6 +1854,8 @@ impl BitViewerApp {
         if !self.show_autocorrelation_panel {
             return;
         }
+
+        self.ensure_autocorrelation();
 
         let mut show_autocorrelation_panel = self.show_autocorrelation_panel;
         egui::Window::new("Autocorrelation")
@@ -2725,11 +2755,11 @@ impl BitViewerApp {
                     .num_columns(2)
                     .spacing(egui::vec2(16.0, 10.0))
                     .show(ui, |ui| {
-                        ui.monospace("Left-click drag in bit / hex / ASCII");
+                        ui.monospace("Ctrl + left-drag in bit / hex / ASCII");
                         ui.label(RichText::new("Paint highlighted columns").color(TEXT_MUTED));
                         ui.end_row();
 
-                        ui.monospace("Right-click drag in bit / hex / ASCII");
+                        ui.monospace("Ctrl + right-drag in bit / hex / ASCII");
                         ui.label(RichText::new("Erase highlighted columns").color(TEXT_MUTED));
                         ui.end_row();
 
@@ -4102,7 +4132,7 @@ impl BitViewerApp {
                         self.derived_view = Some(view);
                         self.derived_view_revision = self.derived_view_revision.saturating_add(1);
                         self.invalidate_render_caches();
-                        self.schedule_autocorrelation();
+                        self.ensure_autocorrelation();
                         self.clear_run_histogram_state();
                         if self.show_run_histogram_panel {
                             self.schedule_run_histogram();
@@ -4647,7 +4677,8 @@ impl BitViewerApp {
         if self.autocorrelation_max_width_bits != clamped {
             self.autocorrelation_max_width_bits = clamped;
             self.sync_autocorrelation_max_width_input();
-            self.schedule_autocorrelation();
+            self.invalidate_autocorrelation_analysis();
+            self.ensure_autocorrelation();
         } else {
             self.sync_autocorrelation_max_width_input();
         }
@@ -4662,7 +4693,8 @@ impl BitViewerApp {
         if self.autocorrelation_sample_bytes != clamped {
             self.autocorrelation_sample_bytes = clamped;
             self.sync_autocorrelation_sample_bytes_input();
-            self.schedule_autocorrelation();
+            self.invalidate_autocorrelation_analysis();
+            self.ensure_autocorrelation();
         } else {
             self.sync_autocorrelation_sample_bytes_input();
         }
@@ -5404,6 +5436,10 @@ fn scroll_area_draw_rect(ui: &Ui, inner_rect: Rect, content_size: Vec2) -> Rect 
     draw_rect
 }
 
+fn draw_modifier_active(modifiers: Modifiers) -> bool {
+    modifiers.ctrl
+}
+
 fn scroll_area_scrollbar_rects(ui: &Ui, inner_rect: Rect, content_size: Vec2) -> Vec<Rect> {
     let scroll_style = ui.spacing().scroll;
     let reserved = scroll_style.bar_width + scroll_style.bar_outer_margin;
@@ -5638,11 +5674,11 @@ fn text_pane_column_step(pane_kind: TextPaneKind, text_char_width: f32) -> f32 {
 mod tests {
     use super::{
         BitViewerApp, DrawGranularity, GraphViewport, TextPaneKind,
-        autocorrelation_width_from_global, hover_bit_col_in_bit_grid, hover_byte_col_in_text_pane,
-        pointer_bit_col_in_bit_grid, pointer_byte_col_in_text_pane, pointer_row_in_scroll_pane,
-        run_histogram_width_from_global, zoom_graph_axis,
+        autocorrelation_width_from_global, draw_modifier_active, hover_bit_col_in_bit_grid,
+        hover_byte_col_in_text_pane, pointer_bit_col_in_bit_grid, pointer_byte_col_in_text_pane,
+        pointer_row_in_scroll_pane, run_histogram_width_from_global, zoom_graph_axis,
     };
-    use eframe::egui::{Rect, pos2};
+    use eframe::egui::{Modifiers, Rect, pos2};
 
     #[test]
     fn byte_draw_segments_toggle_full_bytes() {
@@ -5677,6 +5713,15 @@ mod tests {
             app.active_draw_stroke.map(|stroke| stroke.mode),
             Some(super::DrawStrokeMode::Erase)
         );
+    }
+
+    #[test]
+    fn draw_requires_ctrl_modifier() {
+        assert!(!draw_modifier_active(Modifiers::default()));
+        assert!(draw_modifier_active(Modifiers {
+            ctrl: true,
+            ..Modifiers::default()
+        }));
     }
 
     #[test]
