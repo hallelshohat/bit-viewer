@@ -9,6 +9,14 @@ pub struct RowData {
     pub ascii: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HoverPosition {
+    pub row_index: usize,
+    pub column_index: usize,
+    pub bit_offset: usize,
+    pub byte_offset: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct RowLayout {
     pub row_width_bits: usize,
@@ -125,6 +133,61 @@ pub fn build_bit_window(
     bitmap
 }
 
+pub fn bit_hover_position(
+    view: &DerivedView,
+    layout: &RowLayout,
+    row_index: usize,
+    bit_col: usize,
+) -> Option<HoverPosition> {
+    let RowSlice {
+        group_index,
+        start_bit,
+        bits_to_take,
+    } = row_slice(view, layout, row_index)?;
+    if bit_col >= bits_to_take {
+        return None;
+    }
+
+    let bit_offset = view.group_prefix_bits()[group_index] + start_bit + bit_col;
+    Some(HoverPosition {
+        row_index,
+        column_index: bit_col,
+        bit_offset,
+        byte_offset: bit_offset / 8,
+    })
+}
+
+pub fn byte_hover_position(
+    view: &DerivedView,
+    layout: &RowLayout,
+    row_index: usize,
+    byte_col: usize,
+) -> Option<HoverPosition> {
+    let RowSlice {
+        group_index,
+        start_bit,
+        bits_to_take,
+    } = row_slice(view, layout, row_index)?;
+    let bit_col = byte_col.saturating_mul(8);
+    if bit_col >= bits_to_take {
+        return None;
+    }
+
+    let bit_offset = view.group_prefix_bits()[group_index] + start_bit + bit_col;
+    Some(HoverPosition {
+        row_index,
+        column_index: byte_col,
+        bit_offset,
+        byte_offset: bit_offset / 8,
+    })
+}
+
+struct RowSlice {
+    group_index: usize,
+    start_bit: usize,
+    bits_to_take: usize,
+}
+
 fn locate_group_row(layout: &RowLayout, row_index: usize) -> Option<(usize, usize)> {
     if layout.total_rows == 0 || row_index >= layout.total_rows {
         return None;
@@ -136,6 +199,21 @@ fn locate_group_row(layout: &RowLayout, row_index: usize) -> Option<(usize, usiz
         .saturating_sub(1);
     let row_start = layout.group_row_offsets[group_index];
     Some((group_index, row_index.saturating_sub(row_start)))
+}
+
+fn row_slice(view: &DerivedView, layout: &RowLayout, row_index: usize) -> Option<RowSlice> {
+    let (group_index, row_in_group) = locate_group_row(layout, row_index)?;
+    let group = &view.groups()[group_index];
+    let start_bit = row_in_group.saturating_mul(layout.row_width_bits);
+    let bits_to_take = group
+        .len_bits()
+        .saturating_sub(start_bit)
+        .min(layout.row_width_bits);
+    Some(RowSlice {
+        group_index,
+        start_bit,
+        bits_to_take,
+    })
 }
 
 fn render_text_columns(
@@ -183,7 +261,10 @@ fn push_hex_byte(output: &mut String, byte: u8) {
 mod tests {
     use crate::filters::build_derived_view;
 
-    use super::{BIT_VALUE_NO_DATA, build_bit_window, build_row_layout};
+    use super::{
+        BIT_VALUE_NO_DATA, HoverPosition, bit_hover_position, build_bit_window, build_row_layout,
+        byte_hover_position,
+    };
 
     #[test]
     fn bit_window_marks_cells_past_row_data_as_no_data() {
@@ -194,5 +275,37 @@ mod tests {
 
         assert_eq!(&bitmap[..8], &[1, 0, 1, 0, 0, 0, 0, 0]);
         assert_eq!(&bitmap[8..], &[BIT_VALUE_NO_DATA; 4]);
+    }
+
+    #[test]
+    fn bit_hover_position_uses_absolute_bit_offsets() {
+        let view = build_derived_view(&[0xAB, 0xCD], &Default::default()).unwrap();
+        let layout = build_row_layout(&view, 8);
+
+        assert_eq!(
+            bit_hover_position(&view, &layout, 1, 3),
+            Some(HoverPosition {
+                row_index: 1,
+                column_index: 3,
+                bit_offset: 11,
+                byte_offset: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn byte_hover_position_rejects_partial_row_columns_past_data() {
+        let view = build_derived_view(&[0xAA, 0xB0], &Default::default()).unwrap();
+        let layout = build_row_layout(&view, 12);
+
+        assert_eq!(
+            byte_hover_position(&view, &layout, 0, 0).map(|pos| pos.bit_offset),
+            Some(0)
+        );
+        assert_eq!(
+            byte_hover_position(&view, &layout, 0, 1).map(|pos| pos.bit_offset),
+            Some(8)
+        );
+        assert_eq!(byte_hover_position(&view, &layout, 0, 2), None);
     }
 }

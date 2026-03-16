@@ -30,8 +30,8 @@ use crate::filters::{
 };
 use crate::run_histogram::{RunHistogramResult, analyze_run_histogram_with_progress};
 use crate::viewer::{
-    BIT_VALUE_NO_DATA, RowData, RowLayout, bit_offset_to_row, build_bit_window, build_row,
-    build_row_layout,
+    BIT_VALUE_NO_DATA, HoverPosition, RowData, RowLayout, bit_hover_position, bit_offset_to_row,
+    build_bit_window, build_row, build_row_layout, byte_hover_position,
 };
 
 const DEFAULT_ROW_WIDTH_BITS: usize = 128;
@@ -209,6 +209,29 @@ struct ActiveDrawStroke {
     last_index: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HoverPane {
+    BitGrid,
+    Hex,
+    Ascii,
+}
+
+impl HoverPane {
+    fn label(self) -> &'static str {
+        match self {
+            Self::BitGrid => "Bit Grid",
+            Self::Hex => "Hex",
+            Self::Ascii => "ASCII",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ViewerHoverStatus {
+    pane: HoverPane,
+    position: HoverPosition,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct GraphViewport {
     x_start: f32,
@@ -274,6 +297,7 @@ pub struct BitViewerApp {
     pending_text_scroll_to_row: Option<usize>,
     current_bit_scroll_row: usize,
     current_text_scroll_row: usize,
+    hovered_view_position: Option<ViewerHoverStatus>,
     drawn_bit_columns: BTreeSet<usize>,
     active_draw_stroke: Option<ActiveDrawStroke>,
     file_dialog_rx: Option<Receiver<Option<PathBuf>>>,
@@ -357,6 +381,7 @@ impl Default for BitViewerApp {
             pending_text_scroll_to_row: None,
             current_bit_scroll_row: 0,
             current_text_scroll_row: 0,
+            hovered_view_position: None,
             drawn_bit_columns: BTreeSet::new(),
             active_draw_stroke: None,
             file_dialog_rx: None,
@@ -2540,6 +2565,20 @@ impl BitViewerApp {
                     );
                 }
 
+                if let Some(hover) = self.hovered_view_position {
+                    self.status_chip(
+                        ui,
+                        &format!(
+                            "{} row {} col {} bit {} byte {}",
+                            hover.pane.label(),
+                            hover.position.row_index,
+                            hover.position.column_index,
+                            hover.position.bit_offset,
+                            hover.position.byte_offset,
+                        ),
+                    );
+                }
+
                 if self.rebuild_pending {
                     ui.spinner();
                     ui.label(RichText::new("processing filters").color(TEXT_MUTED));
@@ -3186,6 +3225,8 @@ impl BitViewerApp {
     }
 
     fn show_viewer(&mut self, ui: &mut Ui) {
+        self.hovered_view_position = None;
+
         if self.derived_view.is_none() {
             ui.centered_and_justified(|ui| {
                 if self.rebuild_pending {
@@ -3451,6 +3492,14 @@ impl BitViewerApp {
                         ui.ctx().input(|input| input.pointer.latest_pos()),
                     ),
                 );
+                self.update_hovered_bit_grid_position(
+                    layout,
+                    draw_rect,
+                    output.state.offset,
+                    bit_row_height,
+                    total_rows,
+                    ui.ctx().input(|input| input.pointer.latest_pos()),
+                );
                 self.sync_scroll_positions_on_middle_click(
                     ui,
                     output.inner_rect,
@@ -3569,6 +3618,18 @@ impl BitViewerApp {
                                 ui.ctx().input(|input| input.pointer.latest_pos()),
                             ),
                         );
+                        self.update_hovered_text_position(
+                            layout,
+                            HoverPane::Ascii,
+                            draw_rect,
+                            output.state.offset,
+                            text_row_height,
+                            total_rows,
+                            bytes_per_row,
+                            TextPaneKind::Ascii,
+                            text_char_width,
+                            ui.ctx().input(|input| input.pointer.latest_pos()),
+                        );
                         self.sync_scroll_positions_on_middle_click(
                             ui,
                             output.inner_rect,
@@ -3658,6 +3719,18 @@ impl BitViewerApp {
                                 text_char_width,
                                 ui.ctx().input(|input| input.pointer.latest_pos()),
                             ),
+                        );
+                        self.update_hovered_text_position(
+                            layout,
+                            HoverPane::Hex,
+                            draw_rect,
+                            output.state.offset,
+                            text_row_height,
+                            total_rows,
+                            bytes_per_row,
+                            TextPaneKind::Hex,
+                            text_char_width,
+                            ui.ctx().input(|input| input.pointer.latest_pos()),
                         );
                         self.sync_scroll_positions_on_middle_click(
                             ui,
@@ -3770,6 +3843,80 @@ impl BitViewerApp {
                     Some("File chooser failed before returning a selection.".to_owned());
             }
         }
+    }
+
+    fn update_hovered_bit_grid_position(
+        &mut self,
+        layout: &RowLayout,
+        rect: Rect,
+        scroll_offset: Vec2,
+        row_height: f32,
+        total_rows: usize,
+        pointer_pos: Option<egui::Pos2>,
+    ) {
+        let Some(view) = self.derived_view.as_ref() else {
+            return;
+        };
+        let Some(row_index) =
+            pointer_row_in_scroll_pane(rect, scroll_offset.y, row_height, total_rows, pointer_pos)
+        else {
+            return;
+        };
+        let Some(bit_col) = hover_bit_col_in_bit_grid(
+            rect,
+            scroll_offset.x,
+            self.bit_size,
+            self.row_width_bits,
+            pointer_pos,
+        ) else {
+            return;
+        };
+        let Some(position) = bit_hover_position(view, layout, row_index, bit_col) else {
+            return;
+        };
+
+        self.hovered_view_position = Some(ViewerHoverStatus {
+            pane: HoverPane::BitGrid,
+            position,
+        });
+    }
+
+    fn update_hovered_text_position(
+        &mut self,
+        layout: &RowLayout,
+        pane: HoverPane,
+        rect: Rect,
+        scroll_offset: Vec2,
+        row_height: f32,
+        total_rows: usize,
+        bytes_per_row: usize,
+        pane_kind: TextPaneKind,
+        text_char_width: f32,
+        pointer_pos: Option<egui::Pos2>,
+    ) {
+        let Some(view) = self.derived_view.as_ref() else {
+            return;
+        };
+        let Some(row_index) =
+            pointer_row_in_scroll_pane(rect, scroll_offset.y, row_height, total_rows, pointer_pos)
+        else {
+            return;
+        };
+        let Some(byte_col) = hover_byte_col_in_text_pane(
+            rect,
+            scroll_offset.x,
+            bytes_per_row,
+            pane_kind,
+            text_char_width,
+            pointer_pos,
+        ) else {
+            return;
+        };
+        let Some(position) = byte_hover_position(view, layout, row_index, byte_col) else {
+            return;
+        };
+
+        self.hovered_view_position = Some(ViewerHoverStatus { pane, position });
     }
 
     fn start_export_flow(&mut self) {
@@ -5304,6 +5451,31 @@ fn pointer_bit_col_in_bit_grid(
     Some(bit_col)
 }
 
+fn hover_bit_col_in_bit_grid(
+    rect: Rect,
+    horizontal_scroll: f32,
+    bit_size: f32,
+    row_width_bits: usize,
+    pointer_pos: Option<egui::Pos2>,
+) -> Option<usize> {
+    if row_width_bits == 0 || bit_size <= 0.0 {
+        return None;
+    }
+
+    let pointer_pos = pointer_pos?;
+    if !rect.contains(pointer_pos) {
+        return None;
+    }
+
+    let local_x = (pointer_pos.x - rect.left()) + horizontal_scroll;
+    let content_width = row_width_bits as f32 * bit_size;
+    if !(0.0..content_width).contains(&local_x) {
+        return None;
+    }
+
+    Some((local_x / bit_size).floor().max(0.0) as usize)
+}
+
 fn pointer_byte_col_in_text_pane(
     rect: Rect,
     horizontal_scroll: f32,
@@ -5321,6 +5493,54 @@ fn pointer_byte_col_in_text_pane(
     let local_x =
         ((pointer_pos.x - rect.left()) + horizontal_scroll - TEXT_CELL_PADDING_X).max(0.0);
     Some(((local_x / cell_width).floor().max(0.0) as usize).min(bytes_per_row.saturating_sub(1)))
+}
+
+fn hover_byte_col_in_text_pane(
+    rect: Rect,
+    horizontal_scroll: f32,
+    bytes_per_row: usize,
+    pane_kind: TextPaneKind,
+    text_char_width: f32,
+    pointer_pos: Option<egui::Pos2>,
+) -> Option<usize> {
+    if bytes_per_row == 0 {
+        return None;
+    }
+
+    let pointer_pos = pointer_pos?;
+    if !rect.contains(pointer_pos) {
+        return None;
+    }
+
+    let cell_width = text_pane_column_step(pane_kind, text_char_width);
+    let local_x = (pointer_pos.x - rect.left()) + horizontal_scroll - TEXT_CELL_PADDING_X;
+    let content_width = bytes_per_row as f32 * cell_width;
+    if !(0.0..content_width).contains(&local_x) {
+        return None;
+    }
+
+    Some((local_x / cell_width).floor().max(0.0) as usize)
+}
+
+fn pointer_row_in_scroll_pane(
+    rect: Rect,
+    vertical_scroll: f32,
+    row_height: f32,
+    total_rows: usize,
+    pointer_pos: Option<egui::Pos2>,
+) -> Option<usize> {
+    if total_rows == 0 || row_height <= 0.0 {
+        return None;
+    }
+
+    let pointer_pos = pointer_pos?;
+    if !rect.contains(pointer_pos) {
+        return None;
+    }
+
+    let local_y = (pointer_pos.y - rect.top()) + vertical_scroll;
+    let row_index = (local_y / row_height).floor().max(0.0) as usize;
+    (row_index < total_rows).then_some(row_index)
 }
 
 fn paint_single_text_row(
@@ -5418,8 +5638,9 @@ fn text_pane_column_step(pane_kind: TextPaneKind, text_char_width: f32) -> f32 {
 mod tests {
     use super::{
         BitViewerApp, DrawGranularity, GraphViewport, TextPaneKind,
-        autocorrelation_width_from_global, pointer_bit_col_in_bit_grid,
-        pointer_byte_col_in_text_pane, run_histogram_width_from_global, zoom_graph_axis,
+        autocorrelation_width_from_global, hover_bit_col_in_bit_grid, hover_byte_col_in_text_pane,
+        pointer_bit_col_in_bit_grid, pointer_byte_col_in_text_pane, pointer_row_in_scroll_pane,
+        run_histogram_width_from_global, zoom_graph_axis,
     };
     use eframe::egui::{Rect, pos2};
 
@@ -5477,6 +5698,16 @@ mod tests {
     }
 
     #[test]
+    fn bit_grid_hover_ignores_blank_panel_space() {
+        let rect = Rect::from_min_max(pos2(10.0, 20.0), pos2(210.0, 220.0));
+
+        assert_eq!(
+            hover_bit_col_in_bit_grid(rect, 0.0, 5.0, 16, Some(pos2(95.0, 40.0))),
+            None
+        );
+    }
+
+    #[test]
     fn text_pointer_maps_to_byte_columns() {
         let rect = Rect::from_min_max(pos2(10.0, 20.0), pos2(210.0, 220.0));
         let text_char_width = 8.0;
@@ -5513,6 +5744,53 @@ mod tests {
                 Some(pos2(209.0, 40.0))
             ),
             Some(15)
+        );
+    }
+
+    #[test]
+    fn text_hover_ignores_padding_and_blank_space() {
+        let rect = Rect::from_min_max(pos2(10.0, 20.0), pos2(210.0, 220.0));
+        let text_char_width = 8.0;
+
+        assert_eq!(
+            hover_byte_col_in_text_pane(
+                rect,
+                0.0,
+                4,
+                TextPaneKind::Ascii,
+                text_char_width,
+                Some(pos2(15.0, 40.0))
+            ),
+            None
+        );
+        assert_eq!(
+            hover_byte_col_in_text_pane(
+                rect,
+                0.0,
+                4,
+                TextPaneKind::Ascii,
+                text_char_width,
+                Some(pos2(70.0, 40.0))
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn scroll_pane_pointer_maps_to_rows() {
+        let rect = Rect::from_min_max(pos2(10.0, 20.0), pos2(210.0, 220.0));
+
+        assert_eq!(
+            pointer_row_in_scroll_pane(rect, 0.0, 20.0, 10, Some(pos2(15.0, 39.0))),
+            Some(0)
+        );
+        assert_eq!(
+            pointer_row_in_scroll_pane(rect, 40.0, 20.0, 10, Some(pos2(15.0, 39.0))),
+            Some(2)
+        );
+        assert_eq!(
+            pointer_row_in_scroll_pane(rect, 0.0, 20.0, 2, Some(pos2(15.0, 79.0))),
+            None
         );
     }
 
