@@ -2173,6 +2173,37 @@ impl BitViewerApp {
                             changed = true;
                         }
                     }
+                    FilterStep::SyncOnPreambleWithGroupSize {
+                        bits,
+                        group_size_bits,
+                    } => {
+                        egui::Grid::new(("sync-fixed-grid", index))
+                            .num_columns(2)
+                            .spacing(egui::vec2(12.0, 10.0))
+                            .show(ui, |ui| {
+                                ui.label(RichText::new("Preamble bits").color(TEXT_MUTED));
+                                if ui
+                                    .add(egui::TextEdit::singleline(bits).hint_text("1010 or 0xA"))
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
+                                ui.end_row();
+
+                                ui.label(RichText::new("Group size bits").color(TEXT_MUTED));
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(group_size_bits)
+                                            .range(1..=usize::MAX)
+                                            .speed(1.0),
+                                    )
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
+                                ui.end_row();
+                            });
+                    }
                     FilterStep::Split { group_size_bits } => {
                         egui::Grid::new(("split-grid", index))
                             .num_columns(2)
@@ -2869,6 +2900,10 @@ impl BitViewerApp {
                         let filter_help_steps = [
                             FilterStep::SyncOnPreamble {
                                 bits: String::new(),
+                            },
+                            FilterStep::SyncOnPreambleWithGroupSize {
+                                bits: String::new(),
+                                group_size_bits: 256,
                             },
                             FilterStep::Split { group_size_bits: 8 },
                             FilterStep::Chop { bits: 0 },

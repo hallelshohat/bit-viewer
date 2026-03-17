@@ -71,6 +71,10 @@ pub enum FilterStep {
     SyncOnPreamble {
         bits: String,
     },
+    SyncOnPreambleWithGroupSize {
+        bits: String,
+        group_size_bits: usize,
+    },
     Split {
         group_size_bits: usize,
     },
@@ -118,6 +122,7 @@ impl FilterStep {
     pub fn label(&self) -> &'static str {
         match self {
             Self::SyncOnPreamble { .. } => "Sync on preamble",
+            Self::SyncOnPreambleWithGroupSize { .. } => "Sync on aligned preamble",
             Self::Split { .. } => "Split",
             Self::Chop { .. } => "Chop",
             Self::ReverseBitsPerByte => "Reverse bits in each byte",
@@ -137,6 +142,9 @@ impl FilterStep {
         match self {
             Self::SyncOnPreamble { .. } => {
                 "Split the current bitstream into groups whenever the preamble pattern is found."
+            }
+            Self::SyncOnPreambleWithGroupSize { .. } => {
+                "Anchor on the first preamble match, then split only when later preambles land on that same fixed group-size cadence."
             }
             Self::Split { .. } => {
                 "Flatten the current view, then cut it into fixed-size groups and keep any partial tail group."
@@ -184,12 +192,18 @@ pub struct FilterCommandSpec {
     pub example: &'static str,
 }
 
-const FILTER_COMMAND_SPECS: [FilterCommandSpec; 12] = [
+const FILTER_COMMAND_SPECS: [FilterCommandSpec; 13] = [
     FilterCommandSpec {
         name: "sync",
         usage: "sync <bits>",
         summary: "Split the stream into groups on a preamble bit pattern.",
         example: "sync 1010",
+    },
+    FilterCommandSpec {
+        name: "sync-fixed",
+        usage: "sync-fixed <bits> <group_size_bits>",
+        summary: "Split on preambles aligned to the first match at a fixed group size.",
+        example: "sync-fixed 1010 256",
     },
     FilterCommandSpec {
         name: "split",
@@ -342,27 +356,34 @@ pub fn parse_filter_command(input: &str) -> Result<FilterStep, String> {
 fn filter_command_aliases(index: usize) -> &'static [&'static str] {
     match index {
         0 => &["sync-on-preamble", "sync-preamble", "preamble", "sync"],
-        1 => &["split"],
-        2 => &["chop"],
-        3 => &[
+        1 => &[
+            "sync-on-aligned-preamble",
+            "sync-on-preamble-fixed",
+            "sync-sized",
+            "sync-grouped",
+            "sync-fixed",
+        ],
+        2 => &["split"],
+        3 => &["chop"],
+        4 => &[
             "reverse-bits-per-byte",
             "reverse-bits",
             "reverse-bytes",
             "reverse",
         ],
-        4 => &["invert-bits", "invert"],
-        5 => &["xor-mask", "mask", "xor"],
-        6 => &["lfsr-scramble", "scrambler", "scramble"],
-        7 => &["lfsr-descramble", "descrambler", "descramble"],
-        8 => &["flatten-groups", "flatten"],
-        9 => &[
+        5 => &["invert-bits", "invert"],
+        6 => &["xor-mask", "mask", "xor"],
+        7 => &["lfsr-scramble", "scrambler", "scramble"],
+        8 => &["lfsr-descramble", "descrambler", "descramble"],
+        9 => &["flatten-groups", "flatten"],
+        10 => &[
             "keep-groups-longer-than-bytes",
             "keep-groups",
             "keep-groups-bytes",
             "keep",
         ],
-        10 => &["select-range", "select-bit-range", "range", "select"],
-        11 => &["extract-l2", "extract-packets", "packets", "l2", "extract"],
+        11 => &["select-range", "select-bit-range", "range", "select"],
+        12 => &["extract-l2", "extract-packets", "packets", "l2", "extract"],
         _ => &[],
     }
 }
@@ -394,44 +415,65 @@ fn parse_filter_command_with_index(index: usize, arguments: &str) -> Result<Filt
             parse_preamble_bits(&bits)?;
             Ok(FilterStep::SyncOnPreamble { bits })
         }
-        1 => Ok(FilterStep::Split {
+        1 => {
+            let (bits, group_size_bits) = parse_sync_fixed_arguments(arguments)?;
+            Ok(FilterStep::SyncOnPreambleWithGroupSize {
+                bits,
+                group_size_bits,
+            })
+        }
+        2 => Ok(FilterStep::Split {
             group_size_bits: parse_required_positive_usize(arguments, "split", 8)?,
         }),
-        2 => Ok(FilterStep::Chop {
+        3 => Ok(FilterStep::Chop {
             bits: parse_optional_i64(arguments, "chop", 8)?,
         }),
-        3 => {
+        4 => {
             reject_extra_arguments(arguments, "reverse")?;
             Ok(FilterStep::ReverseBitsPerByte)
         }
-        4 => {
+        5 => {
             reject_extra_arguments(arguments, "invert")?;
             Ok(FilterStep::InvertBits)
         }
-        5 => Ok(FilterStep::XorMask {
+        6 => Ok(FilterStep::XorMask {
             mask: parse_optional_u8(arguments, "xor", 0xFF)?,
         }),
-        6 => {
+        7 => {
             let (seed, polynomial) = parse_lfsr_arguments(arguments, "scramble")?;
             Ok(FilterStep::LfsrScramble { seed, polynomial })
         }
-        7 => {
+        8 => {
             let (seed, polynomial) = parse_lfsr_arguments(arguments, "descramble")?;
             Ok(FilterStep::LfsrDescramble { seed, polynomial })
         }
-        8 => {
+        9 => {
             reject_extra_arguments(arguments, "flatten")?;
             Ok(FilterStep::Flatten)
         }
-        9 => Ok(FilterStep::KeepGroupsLongerThanBytes {
+        10 => Ok(FilterStep::KeepGroupsLongerThanBytes {
             min_bytes: parse_optional_usize(arguments, "keep", 6)?,
         }),
-        10 => parse_select_arguments(arguments),
-        11 => Ok(FilterStep::ExtractL2Packets {
+        11 => parse_select_arguments(arguments),
+        12 => Ok(FilterStep::ExtractL2Packets {
             protocol: parse_l2_protocol(arguments)?,
         }),
         _ => Err("Unknown filter command.".to_owned()),
     }
+}
+
+fn parse_sync_fixed_arguments(arguments: &str) -> Result<(String, usize), String> {
+    let trimmed = arguments.trim();
+    let Some((bits, group_size_bits)) = trimmed.split_once(char::is_whitespace) else {
+        return Err(
+            "`sync-fixed` expects `<bits> <group_size_bits>`, for example `1010 256`.".to_owned(),
+        );
+    };
+
+    let bits = bits.trim().to_owned();
+    parse_preamble_bits(&bits)?;
+    let group_size_bits = parse_required_positive_usize(group_size_bits, "sync-fixed", 256)?;
+    Ok((bits, group_size_bits))
 }
 
 fn parse_select_arguments(arguments: &str) -> Result<FilterStep, String> {
@@ -1219,6 +1261,39 @@ fn apply_step(state: PipelineState, step: &FilterStep) -> Result<PipelineState, 
 
             Ok(PipelineState::Grouped(groups))
         }
+        FilterStep::SyncOnPreambleWithGroupSize {
+            bits,
+            group_size_bits,
+        } => {
+            if *group_size_bits == 0 {
+                return Err(
+                    "Aligned preamble sync requires a group size greater than zero bits."
+                        .to_owned(),
+                );
+            }
+
+            let pattern = parse_preamble_bits(bits)?;
+            let buffer = state.into_flat();
+            let starts = find_aligned_group_starts(&buffer, &pattern, *group_size_bits);
+
+            if starts.is_empty() {
+                return Err("Preamble was not found in the current stream.".to_owned());
+            }
+
+            let mut groups = Vec::with_capacity(starts.len());
+            for (index, start_bit) in starts.iter().copied().enumerate() {
+                let end_bit = starts
+                    .get(index + 1)
+                    .copied()
+                    .unwrap_or_else(|| buffer.len_bits());
+                let group = buffer.slice_bits(start_bit, end_bit.saturating_sub(start_bit));
+                if !group.is_empty() {
+                    groups.push(group);
+                }
+            }
+
+            Ok(PipelineState::Grouped(groups))
+        }
         FilterStep::KeepGroupsLongerThanBytes { min_bytes } => match state {
             PipelineState::Flat(_) => Err(
                 "Keep-groups filter requires a grouping step earlier in the pipeline.".to_owned(),
@@ -1626,6 +1701,26 @@ fn find_group_starts(buffer: &BitBuffer, pattern: &[u8]) -> Vec<usize> {
     }
 
     starts
+}
+
+fn find_aligned_group_starts(
+    buffer: &BitBuffer,
+    pattern: &[u8],
+    group_size_bits: usize,
+) -> Vec<usize> {
+    if group_size_bits == 0 {
+        return Vec::new();
+    }
+
+    let starts = find_group_starts(buffer, pattern);
+    let Some(first_start) = starts.first().copied() else {
+        return Vec::new();
+    };
+
+    starts
+        .into_iter()
+        .filter(|start| start.saturating_sub(first_start) % group_size_bits == 0)
+        .collect()
 }
 
 fn pattern_matches(buffer: &BitBuffer, start_bit: usize, pattern: &[u8]) -> bool {
@@ -2210,6 +2305,13 @@ mod tests {
             }
         );
         assert_eq!(
+            super::parse_filter_command("sync-fixed 1010 256").expect("sync-fixed should parse"),
+            FilterStep::SyncOnPreambleWithGroupSize {
+                bits: "1010".to_owned(),
+                group_size_bits: 256,
+            }
+        );
+        assert_eq!(
             super::parse_filter_command("chop").expect("chop should use its default"),
             FilterStep::Chop { bits: 8 }
         );
@@ -2311,6 +2413,25 @@ mod tests {
         assert_eq!(
             group_bits(&view),
             vec![vec![1, 0, 1, 0, 0, 0, 0, 1], vec![1, 0, 1, 0, 1, 1, 1, 1],]
+        );
+    }
+
+    #[test]
+    fn sync_fixed_anchors_to_the_first_preamble_offset() {
+        let bits = [0, 1, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1, 1];
+        let state = super::apply_step(
+            super::PipelineState::Flat(super::BitBuffer::from_bits(bits)),
+            &FilterStep::SyncOnPreambleWithGroupSize {
+                bits: "1010".to_owned(),
+                group_size_bits: 8,
+            },
+        )
+        .expect("pipeline should succeed");
+        let view = super::build_derived_view_from_state(state);
+
+        assert_eq!(
+            group_bits(&view),
+            vec![vec![1, 0, 1, 0, 1, 0, 1, 0], vec![1, 0, 1, 0, 0, 1, 1, 1],]
         );
     }
 
