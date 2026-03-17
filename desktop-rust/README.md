@@ -15,6 +15,7 @@
   - invert bits
   - reverse bits inside each byte
   - XOR mask
+  - LFSR scramble / descramble with configurable seed and polynomial
   - preamble sync
   - group length filtering
   - bit-range selection from each group

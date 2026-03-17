@@ -80,6 +80,14 @@ pub enum FilterStep {
     XorMask {
         mask: u8,
     },
+    LfsrScramble {
+        seed: String,
+        polynomial: String,
+    },
+    LfsrDescramble {
+        seed: String,
+        polynomial: String,
+    },
     Flatten,
     KeepGroupsLongerThanBytes {
         min_bytes: usize,
@@ -102,6 +110,8 @@ impl FilterStep {
             Self::ReverseBitsPerByte => "Reverse bits in each byte",
             Self::InvertBits => "Invert bits",
             Self::XorMask { .. } => "XOR byte mask",
+            Self::LfsrScramble { .. } => "LFSR scramble",
+            Self::LfsrDescramble { .. } => "LFSR descramble",
             Self::Flatten => "Flatten groups",
             Self::KeepGroupsLongerThanBytes { .. } => "Keep groups longer than bytes",
             Self::SelectBitRangeFromGroup { .. } => "Select bit range from group",
@@ -127,6 +137,12 @@ impl FilterStep {
             Self::XorMask { .. } => {
                 "XOR every byte with a mask to toggle selected bit positions consistently across the view."
             }
+            Self::LfsrScramble { .. } => {
+                "Scramble each bit with a self-synchronizing LFSR using a polynomial such as x^7+x^3+1."
+            }
+            Self::LfsrDescramble { .. } => {
+                "Descramble a self-synchronizing LFSR stream using the same seed and polynomial, for example x^7+x^3+1."
+            }
             Self::Flatten => {
                 "Concatenate all current groups into one continuous group while preserving the visible bit order."
             }
@@ -151,7 +167,7 @@ pub struct FilterCommandSpec {
     pub example: &'static str,
 }
 
-const FILTER_COMMAND_SPECS: [FilterCommandSpec; 10] = [
+const FILTER_COMMAND_SPECS: [FilterCommandSpec; 12] = [
     FilterCommandSpec {
         name: "sync",
         usage: "sync <bits>",
@@ -187,6 +203,18 @@ const FILTER_COMMAND_SPECS: [FilterCommandSpec; 10] = [
         usage: "xor <mask>",
         summary: "XOR every byte with a mask.",
         example: "xor 0xff",
+    },
+    FilterCommandSpec {
+        name: "scramble",
+        usage: "scramble <seed> <polynomial>",
+        summary: "Scramble bits with a self-synchronizing LFSR.",
+        example: "scramble 0x7f x^7+x^3+1",
+    },
+    FilterCommandSpec {
+        name: "descramble",
+        usage: "descramble <seed> <polynomial>",
+        summary: "Descramble bits with a self-synchronizing LFSR.",
+        example: "descramble 0x7f x^7+x^3+1",
     },
     FilterCommandSpec {
         name: "flatten",
@@ -307,15 +335,17 @@ fn filter_command_aliases(index: usize) -> &'static [&'static str] {
         ],
         4 => &["invert-bits", "invert"],
         5 => &["xor-mask", "mask", "xor"],
-        6 => &["flatten-groups", "flatten"],
-        7 => &[
+        6 => &["lfsr-scramble", "scrambler", "scramble"],
+        7 => &["lfsr-descramble", "descrambler", "descramble"],
+        8 => &["flatten-groups", "flatten"],
+        9 => &[
             "keep-groups-longer-than-bytes",
             "keep-groups",
             "keep-groups-bytes",
             "keep",
         ],
-        8 => &["select-range", "select-bit-range", "range", "select"],
-        9 => &["extract-l2", "extract-packets", "packets", "l2", "extract"],
+        10 => &["select-range", "select-bit-range", "range", "select"],
+        11 => &["extract-l2", "extract-packets", "packets", "l2", "extract"],
         _ => &[],
     }
 }
@@ -365,13 +395,21 @@ fn parse_filter_command_with_index(index: usize, arguments: &str) -> Result<Filt
             mask: parse_optional_u8(arguments, "xor", 0xFF)?,
         }),
         6 => {
+            let (seed, polynomial) = parse_lfsr_arguments(arguments, "scramble")?;
+            Ok(FilterStep::LfsrScramble { seed, polynomial })
+        }
+        7 => {
+            let (seed, polynomial) = parse_lfsr_arguments(arguments, "descramble")?;
+            Ok(FilterStep::LfsrDescramble { seed, polynomial })
+        }
+        8 => {
             reject_extra_arguments(arguments, "flatten")?;
             Ok(FilterStep::Flatten)
         }
-        7 => Ok(FilterStep::KeepGroupsLongerThanBytes {
+        9 => Ok(FilterStep::KeepGroupsLongerThanBytes {
             min_bytes: parse_optional_usize(arguments, "keep", 6)?,
         }),
-        8 => {
+        10 => {
             let [start_bit, length_bits] = parse_usize_list(arguments, "select", &[0, 48])?
                 .try_into()
                 .expect("select should produce exactly two values");
@@ -380,7 +418,7 @@ fn parse_filter_command_with_index(index: usize, arguments: &str) -> Result<Filt
                 length_bits,
             })
         }
-        9 => Ok(FilterStep::ExtractL2Packets {
+        11 => Ok(FilterStep::ExtractL2Packets {
             protocol: parse_l2_protocol(arguments)?,
         }),
         _ => Err("Unknown filter command.".to_owned()),
@@ -436,6 +474,19 @@ fn parse_optional_u8(arguments: &str, command: &str, default: u8) -> Result<u8, 
     parse_u8_token(parts[0], command)
 }
 
+fn parse_lfsr_arguments(arguments: &str, command: &str) -> Result<(String, String), String> {
+    let trimmed = arguments.trim();
+    let Some((seed, polynomial)) = trimmed.split_once(char::is_whitespace) else {
+        return Err(format!(
+            "`{command}` expects `<seed> <polynomial>`, for example `0x7f x^7+x^3+1`."
+        ));
+    };
+
+    parse_u64_token(seed.trim(), command)?;
+    parse_lfsr_polynomial(polynomial.trim(), command)?;
+    Ok((seed.trim().to_owned(), polynomial.trim().to_owned()))
+}
+
 fn parse_usize_list(
     arguments: &str,
     command: &str,
@@ -483,6 +534,20 @@ fn parse_u8_token(token: &str, command: &str) -> Result<u8, String> {
         token
             .parse::<u8>()
             .map_err(|_| format!("`{command}` expects a byte-sized number, got `{token}`."))
+    }
+}
+
+fn parse_u64_token(token: &str, command: &str) -> Result<u64, String> {
+    if let Some(hex) = token
+        .strip_prefix("0x")
+        .or_else(|| token.strip_prefix("0X"))
+    {
+        u64::from_str_radix(hex, 16)
+            .map_err(|_| format!("`{command}` expects a valid number, got `{token}`."))
+    } else {
+        token
+            .parse::<u64>()
+            .map_err(|_| format!("`{command}` expects a valid number, got `{token}`."))
     }
 }
 
@@ -717,6 +782,127 @@ impl PipelineState {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LfsrConfig {
+    seed: u64,
+    feedback_mask: u64,
+    width: u32,
+    register_mask: u64,
+}
+
+impl LfsrConfig {
+    fn parse(seed: &str, polynomial: &str, command: &str) -> Result<Self, String> {
+        let seed = parse_u64_token(seed.trim(), command)?;
+        let parsed_polynomial = parse_lfsr_polynomial(polynomial.trim(), command)?;
+
+        let width = bit_width(seed).max(parsed_polynomial.max_delay);
+        let register_mask = low_bits_mask(width);
+        Ok(Self {
+            seed: seed & register_mask,
+            feedback_mask: parsed_polynomial.feedback_mask & register_mask,
+            width,
+            register_mask,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ParsedLfsrPolynomial {
+    max_delay: u32,
+    feedback_mask: u64,
+}
+
+fn parse_lfsr_polynomial(polynomial: &str, command: &str) -> Result<ParsedLfsrPolynomial, String> {
+    let trimmed = polynomial.trim();
+    if trimmed.is_empty() {
+        return Err(format!(
+            "`{command}` requires a polynomial such as `x^7+x^3+1`."
+        ));
+    }
+
+    if !trimmed.contains('x') && !trimmed.contains('X') {
+        let numeric = parse_u64_token(trimmed, command)?;
+        if numeric == 0 {
+            return Err(format!("`{command}` requires a non-zero polynomial."));
+        }
+
+        return Ok(ParsedLfsrPolynomial {
+            max_delay: bit_width(numeric),
+            feedback_mask: numeric,
+        });
+    }
+
+    let normalized = trimmed
+        .replace(char::is_whitespace, "")
+        .to_ascii_lowercase();
+    let mut max_delay = 0u32;
+    let mut feedback_mask = 0u64;
+    let mut saw_delay = false;
+
+    for term in normalized.split('+') {
+        if term.is_empty() {
+            return Err(format!(
+                "`{command}` expects a polynomial like `x^7+x^3+1`, got `{polynomial}`."
+            ));
+        }
+
+        let exponent = parse_lfsr_term(term, command, polynomial)?;
+        if exponent > 0 {
+            saw_delay = true;
+            max_delay = max_delay.max(exponent);
+        }
+    }
+
+    if !saw_delay {
+        return Err(format!(
+            "`{command}` requires a polynomial with degree at least 1, such as `x^7+x^3+1`."
+        ));
+    }
+
+    for term in normalized.split('+') {
+        let exponent = parse_lfsr_term(term, command, polynomial)?;
+        if exponent == 0 {
+            continue;
+        }
+        feedback_mask |= 1u64 << (exponent - 1);
+    }
+
+    Ok(ParsedLfsrPolynomial {
+        max_delay,
+        feedback_mask,
+    })
+}
+
+fn parse_lfsr_term(term: &str, command: &str, original: &str) -> Result<u32, String> {
+    if term == "1" {
+        return Ok(0);
+    }
+    if term == "x" {
+        return Ok(1);
+    }
+    if let Some(exponent) = term.strip_prefix("x^") {
+        let exponent = exponent.parse::<u32>().map_err(|_| {
+            format!("`{command}` expects a polynomial like `x^7+x^3+1`, got `{original}`.")
+        })?;
+        if exponent > 63 {
+            return Err(format!(
+                "`{command}` supports polynomial exponents up to 63, got `x^{exponent}`."
+            ));
+        }
+        return Ok(exponent);
+    }
+
+    Err(format!(
+        "`{command}` expects a polynomial like `x^7+x^3+1`, got `{original}`."
+    ))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LfsrMode {
+    Scramble,
+    Descramble,
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn build_derived_view(bytes: &[u8], pipeline: &FilterPipeline) -> Result<DerivedView, String> {
     build_cached_filter_state(bytes, pipeline).map(|state| state.to_derived_view())
@@ -834,6 +1020,14 @@ fn apply_step(state: PipelineState, step: &FilterStep) -> Result<PipelineState, 
         FilterStep::ReverseBitsPerByte => Ok(state.map_bytes(u8::reverse_bits)),
         FilterStep::InvertBits => Ok(state.map_bytes(|byte| !byte)),
         FilterStep::XorMask { mask } => Ok(state.map_bytes(|byte| byte ^ mask)),
+        FilterStep::LfsrScramble { seed, polynomial } => {
+            let config = LfsrConfig::parse(seed, polynomial, "scramble")?;
+            Ok(apply_lfsr(state, config, LfsrMode::Scramble))
+        }
+        FilterStep::LfsrDescramble { seed, polynomial } => {
+            let config = LfsrConfig::parse(seed, polynomial, "descramble")?;
+            Ok(apply_lfsr(state, config, LfsrMode::Descramble))
+        }
         FilterStep::Flatten => Ok(PipelineState::Grouped(vec![state.into_flat()])),
         FilterStep::SyncOnPreamble { bits } => {
             let pattern = parse_preamble_bits(bits)?;
@@ -885,6 +1079,61 @@ fn apply_step(state: PipelineState, step: &FilterStep) -> Result<PipelineState, 
             )),
         },
         FilterStep::ExtractL2Packets { protocol } => extract_l2_packets(state, *protocol),
+    }
+}
+
+fn apply_lfsr(state: PipelineState, config: LfsrConfig, mode: LfsrMode) -> PipelineState {
+    match state {
+        PipelineState::Flat(buffer) => {
+            PipelineState::Flat(apply_lfsr_to_buffer(&buffer, config, mode))
+        }
+        PipelineState::Grouped(groups) => PipelineState::Grouped(
+            groups
+                .into_iter()
+                .map(|group| apply_lfsr_to_buffer(&group, config, mode))
+                .collect(),
+        ),
+    }
+}
+
+fn apply_lfsr_to_buffer(buffer: &BitBuffer, config: LfsrConfig, mode: LfsrMode) -> BitBuffer {
+    let mut register = config.seed & config.register_mask;
+    let mut output = BitBuffer::default();
+
+    for bit_index in 0..buffer.len_bits() {
+        let input_bit = buffer.bit(bit_index).unwrap_or(0);
+        let feedback_bit = parity_bit(register & config.feedback_mask);
+        let output_bit = input_bit ^ feedback_bit;
+        output.push_bit(output_bit);
+
+        let shifted = register << 1;
+        let history_bit = match mode {
+            LfsrMode::Scramble => output_bit,
+            LfsrMode::Descramble => input_bit,
+        } as u64;
+        register = if config.width == u64::BITS {
+            shifted | history_bit
+        } else {
+            (shifted | history_bit) & config.register_mask
+        };
+    }
+
+    output
+}
+
+fn parity_bit(value: u64) -> u8 {
+    (value.count_ones() & 1) as u8
+}
+
+fn bit_width(value: u64) -> u32 {
+    u64::BITS - value.leading_zeros()
+}
+
+fn low_bits_mask(width: u32) -> u64 {
+    if width >= u64::BITS {
+        u64::MAX
+    } else {
+        (1u64 << width) - 1
     }
 }
 
@@ -1693,6 +1942,22 @@ mod tests {
             FilterStep::XorMask { mask: 0xAA }
         );
         assert_eq!(
+            super::parse_filter_command("scramble 0x7f x^7+x^3+1")
+                .expect("scramble should parse polynomial notation"),
+            FilterStep::LfsrScramble {
+                seed: "0x7f".to_owned(),
+                polynomial: "x^7+x^3+1".to_owned(),
+            }
+        );
+        assert_eq!(
+            super::parse_filter_command("descramble 127 x^7 + x^3 + 1")
+                .expect("descramble should parse spaced polynomial notation"),
+            FilterStep::LfsrDescramble {
+                seed: "127".to_owned(),
+                polynomial: "x^7 + x^3 + 1".to_owned(),
+            }
+        );
+        assert_eq!(
             super::parse_filter_command("extract cisco hdlc")
                 .expect("extract should parse protocol aliases"),
             FilterStep::ExtractL2Packets {
@@ -1738,6 +2003,127 @@ mod tests {
             group_bits(&view),
             vec![vec![1, 0, 1, 0, 0, 0, 0, 1], vec![1, 0, 1, 0, 1, 1, 1, 1],]
         );
+    }
+
+    #[test]
+    fn lfsr_scramble_and_descramble_round_trip_flat_input() {
+        let bytes = [0xA5, 0x5A, 0xFF, 0x00];
+        let pipeline = FilterPipeline {
+            steps: vec![
+                FilterStep::LfsrScramble {
+                    seed: "0x7f".to_owned(),
+                    polynomial: "x^7+x^3+1".to_owned(),
+                },
+                FilterStep::LfsrDescramble {
+                    seed: "0x7f".to_owned(),
+                    polynomial: "x^7+x^3+1".to_owned(),
+                },
+            ],
+        };
+
+        let view = build_derived_view(&bytes, &pipeline).expect("LFSR round trip should succeed");
+        assert_eq!(group_bytes(&view), vec![bytes.to_vec()]);
+    }
+
+    #[test]
+    fn lfsr_scramble_and_descramble_round_trip_grouped_input() {
+        let groups = vec![vec![0xAA, 0x55], vec![0xF0], vec![0x0F, 0x33, 0xCC]];
+        let pipeline = FilterPipeline {
+            steps: vec![
+                FilterStep::LfsrScramble {
+                    seed: "0x15".to_owned(),
+                    polynomial: "x^4+1".to_owned(),
+                },
+                FilterStep::LfsrDescramble {
+                    seed: "0x15".to_owned(),
+                    polynomial: "x^4+1".to_owned(),
+                },
+            ],
+        };
+
+        let view = super::build_derived_view_from_groups(&groups, &pipeline)
+            .expect("grouped LFSR round trip should succeed");
+        assert_eq!(group_bytes(&view), groups);
+    }
+
+    #[test]
+    fn etsi_polynomial_matches_published_zero_input_recursion() {
+        let bytes = [0u8; 16];
+        let pipeline = FilterPipeline {
+            steps: vec![FilterStep::LfsrScramble {
+                seed: "1".to_owned(),
+                polynomial: "x^23+x^18+1".to_owned(),
+            }],
+        };
+
+        let view = build_derived_view(&bytes, &pipeline).expect("scrambler should build");
+        let bits = group_bits(&view)
+            .pop()
+            .expect("flat input should yield one group");
+
+        for index in 23..bits.len() {
+            assert_eq!(
+                bits[index],
+                bits[index - 18] ^ bits[index - 23],
+                "ETSI recursion failed at bit {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn intel_10gbase_r_descrambler_self_synchronizes_after_58_bits() {
+        let bytes = [
+            0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x55, 0xAA, 0x11, 0x22, 0x33, 0x44,
+            0x66, 0x77, 0x88, 0x99, 0xAB, 0xCD, 0xEF, 0x01, 0x23, 0x45,
+        ];
+        let pipeline = FilterPipeline {
+            steps: vec![
+                FilterStep::LfsrScramble {
+                    seed: "0x3ffffffffffffff".to_owned(),
+                    polynomial: "x^58+x^39+1".to_owned(),
+                },
+                FilterStep::LfsrDescramble {
+                    seed: "1".to_owned(),
+                    polynomial: "x^58+x^39+1".to_owned(),
+                },
+            ],
+        };
+
+        let view = build_derived_view(&bytes, &pipeline).expect("pipeline should succeed");
+        let bits = group_bits(&view)
+            .pop()
+            .expect("flat input should yield one group");
+        let original_bits = bytes_to_bits(&bytes);
+
+        assert_eq!(&bits[58..], &original_bits[58..]);
+    }
+
+    #[test]
+    fn ppp_over_sonet_single_scrambled_bit_error_becomes_two_descrambled_bits() {
+        let scrambled_error = bits_to_bytes(&[
+            1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+        ]);
+        let pipeline = FilterPipeline {
+            steps: vec![FilterStep::LfsrDescramble {
+                seed: "0".to_owned(),
+                polynomial: "x^43+1".to_owned(),
+            }],
+        };
+
+        let view =
+            build_derived_view(&scrambled_error, &pipeline).expect("descrambler should build");
+        let bits = group_bits(&view)
+            .pop()
+            .expect("flat input should yield one group");
+        let errored_positions = bits
+            .iter()
+            .enumerate()
+            .filter_map(|(index, bit)| (*bit != 0).then_some(index))
+            .collect::<Vec<_>>();
+
+        assert_eq!(errored_positions, vec![0, 43]);
     }
 
     #[test]

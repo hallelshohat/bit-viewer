@@ -2201,6 +2201,38 @@ impl BitViewerApp {
                                 ui.end_row();
                             });
                     }
+                    FilterStep::LfsrScramble { seed, polynomial }
+                    | FilterStep::LfsrDescramble { seed, polynomial } => {
+                        egui::Grid::new(("lfsr-grid", index))
+                            .num_columns(2)
+                            .spacing(egui::vec2(12.0, 10.0))
+                            .show(ui, |ui| {
+                                ui.label(RichText::new("Seed").color(TEXT_MUTED));
+                                if ui
+                                    .add_sized(
+                                        [ui.available_width(), 28.0],
+                                        egui::TextEdit::singleline(seed).hint_text("0x7f or 127"),
+                                    )
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
+                                ui.end_row();
+
+                                ui.label(RichText::new("Polynomial").color(TEXT_MUTED));
+                                if ui
+                                    .add_sized(
+                                        [ui.available_width(), 28.0],
+                                        egui::TextEdit::singleline(polynomial)
+                                            .hint_text("x^7+x^3+1"),
+                                    )
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
+                                ui.end_row();
+                            });
+                    }
                     FilterStep::KeepGroupsLongerThanBytes { min_bytes } => {
                         egui::Grid::new(("keep-groups-grid", index))
                             .num_columns(2)
@@ -2316,7 +2348,7 @@ impl BitViewerApp {
             );
             ui.label(
                 RichText::new(
-                    "Type a command such as `split 256`, `chop 8`, or `extract ethernet`. Press Tab to complete the command name.",
+                    "Type a command such as `split 256`, `scramble 0x7f x^7+x^3+1`, or `extract ethernet`. Press Tab to complete the command name.",
                 )
                 .small()
                 .color(TEXT_MUTED),
@@ -2543,6 +2575,14 @@ impl BitViewerApp {
                             FilterStep::ReverseBitsPerByte,
                             FilterStep::InvertBits,
                             FilterStep::XorMask { mask: 0 },
+                            FilterStep::LfsrScramble {
+                                seed: String::new(),
+                                polynomial: String::new(),
+                            },
+                            FilterStep::LfsrDescramble {
+                                seed: String::new(),
+                                polynomial: String::new(),
+                            },
                             FilterStep::Flatten,
                             FilterStep::KeepGroupsLongerThanBytes { min_bytes: 0 },
                             FilterStep::SelectBitRangeFromGroup {
