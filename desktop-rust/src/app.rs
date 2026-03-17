@@ -57,6 +57,9 @@ const RUN_HISTOGRAM_WINDOW_MIN_HEIGHT: f32 = 320.0;
 const RUN_HISTOGRAM_GRAPH_MIN_WIDTH: f32 = 320.0;
 const RUN_HISTOGRAM_GRAPH_MAX_WIDTH: f32 = 580.0;
 const DEFAULT_BIT_SIZE: f32 = 7.0;
+const DEFAULT_GRID_GROUP_BITS: usize = 8;
+const MIN_GRID_GROUP_BITS: usize = 1;
+const MAX_GRID_GROUP_BITS: usize = usize::MAX;
 const MIN_BIT_SIZE: f32 = 2.0;
 const MAX_BIT_SIZE: f32 = 24.0;
 const ROW_WIDTH_STEP_BITS: usize = 1;
@@ -280,6 +283,8 @@ pub struct BitViewerApp {
     row_width_bits: usize,
     target_row_width_bits: usize,
     row_width_input: String,
+    bit_grid_group_bits: usize,
+    bit_grid_group_input: String,
     bit_size: f32,
     target_bit_size: f32,
     autocorrelation_result: Option<AutoCorrelationResult>,
@@ -364,6 +369,8 @@ impl Default for BitViewerApp {
             row_width_bits: DEFAULT_ROW_WIDTH_BITS,
             target_row_width_bits: DEFAULT_ROW_WIDTH_BITS,
             row_width_input: DEFAULT_ROW_WIDTH_BITS.to_string(),
+            bit_grid_group_bits: DEFAULT_GRID_GROUP_BITS,
+            bit_grid_group_input: DEFAULT_GRID_GROUP_BITS.to_string(),
             bit_size: DEFAULT_BIT_SIZE,
             target_bit_size: DEFAULT_BIT_SIZE,
             autocorrelation_result: None,
@@ -1407,6 +1414,10 @@ impl BitViewerApp {
                 }
                 ui.end_row();
 
+                ui.label(RichText::new("Grid groups").color(TEXT_MUTED));
+                self.show_grid_group_selector(ui);
+                ui.end_row();
+
                 ui.label(RichText::new("Bit size").color(TEXT_MUTED));
                 let bit_size_response = ui.add(
                     egui::Slider::new(&mut self.target_bit_size, MIN_BIT_SIZE..=MAX_BIT_SIZE)
@@ -1630,6 +1641,7 @@ impl BitViewerApp {
                     },
                 );
                 self.status_chip(ui, &format!("{} bits/row", self.row_width_bits));
+                self.status_chip(ui, &format!("{}-bit grid", self.bit_grid_group_bits));
                 self.status_chip(ui, &format!("{:.0}px bits", self.bit_size));
                 if self.autocorrelation_pending {
                     if let Some((completed, total, fraction)) = self.autocorrelation_progress() {
@@ -2633,6 +2645,7 @@ impl BitViewerApp {
                         ui,
                         &format!("{} bytes rounded", view.total_bytes_rounded_up()),
                     );
+                    self.status_chip(ui, &format!("{}-bit grid", self.bit_grid_group_bits));
                 }
 
                 if let Some(hover) = self.hovered_view_position {
@@ -3278,6 +3291,19 @@ impl BitViewerApp {
         ui.add_space(8.0);
     }
 
+    fn show_grid_group_selector(&mut self, ui: &mut Ui) {
+        let response = ui.add_sized(
+            [96.0, 28.0],
+            egui::TextEdit::singleline(&mut self.bit_grid_group_input),
+        );
+        if response.changed() {
+            self.apply_bit_grid_group_input(false);
+        }
+        if response.lost_focus() {
+            self.apply_bit_grid_group_input(true);
+        }
+    }
+
     fn sync_scroll_positions_on_middle_click(&mut self, ui: &Ui, rect: Rect, row: usize) {
         let should_sync = ui.ctx().input(|input| {
             input.pointer.button_clicked(PointerButton::Middle)
@@ -3453,7 +3479,10 @@ impl BitViewerApp {
                 self.viewer_pane_header(
                     ui,
                     "Bit Grid",
-                    &format!("{} bits per row", self.row_width_bits),
+                    &format!(
+                        "{} bits per row, {}-bit groups",
+                        self.row_width_bits, self.bit_grid_group_bits
+                    ),
                 );
                 ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
 
@@ -3538,6 +3567,7 @@ impl BitViewerApp {
                             cache_start_col,
                             cache_col_count,
                             cache_row_count,
+                            self.bit_grid_group_bits,
                             self.bit_size,
                             bit_row_height,
                         );
@@ -4643,6 +4673,30 @@ impl BitViewerApp {
         }
     }
 
+    fn apply_bit_grid_group_input(&mut self, commit: bool) {
+        let trimmed = self.bit_grid_group_input.trim();
+        if trimmed.is_empty() {
+            if commit {
+                self.sync_bit_grid_group_input();
+            }
+            return;
+        }
+
+        let Ok(parsed) = trimmed.parse::<usize>() else {
+            if commit {
+                self.sync_bit_grid_group_input();
+            }
+            return;
+        };
+
+        let clamped = parsed.clamp(MIN_GRID_GROUP_BITS, MAX_GRID_GROUP_BITS);
+        self.set_bit_grid_group_bits(clamped);
+
+        if commit || parsed != clamped {
+            self.sync_bit_grid_group_input();
+        }
+    }
+
     fn apply_autocorrelation_max_width_input(&mut self, commit: bool) {
         let trimmed = self.autocorrelation_max_width_input.trim();
         if trimmed.is_empty() {
@@ -4708,6 +4762,12 @@ impl BitViewerApp {
         self.row_width_input = clamped.to_string();
     }
 
+    fn set_bit_grid_group_bits(&mut self, group_width_bits: usize) {
+        let clamped = group_width_bits.clamp(MIN_GRID_GROUP_BITS, MAX_GRID_GROUP_BITS);
+        self.bit_grid_group_bits = clamped;
+        self.bit_grid_group_input = clamped.to_string();
+    }
+
     fn set_autocorrelation_max_width(&mut self, max_width_bits: usize) {
         let clamped = max_width_bits.clamp(
             MIN_AUTOCORRELATION_MAX_WIDTH_BITS,
@@ -4742,6 +4802,10 @@ impl BitViewerApp {
 
     fn sync_row_width_input(&mut self) {
         self.row_width_input = self.target_row_width_bits.to_string();
+    }
+
+    fn sync_bit_grid_group_input(&mut self) {
+        self.bit_grid_group_input = self.bit_grid_group_bits.to_string();
     }
 
     fn sync_autocorrelation_max_width_input(&mut self) {
@@ -5392,6 +5456,7 @@ fn paint_bit_grid_lines(
     start_col: usize,
     col_count: usize,
     row_count: usize,
+    group_width_bits: usize,
     bit_size: f32,
     row_height: f32,
 ) {
@@ -5402,7 +5467,7 @@ fn paint_bit_grid_lines(
     for bit_offset in 0..=col_count {
         let bit_index = start_col + bit_offset;
         let x = left + bit_offset as f32 * bit_size;
-        let stroke = if bit_index > 0 && bit_index % 8 == 0 {
+        let stroke = if is_group_divider(bit_index, group_width_bits) {
             Stroke::new(1.5, BYTE_DIVIDER_COLOR)
         } else {
             Stroke::new(0.5, BIT_BORDER_COLOR)
@@ -5417,6 +5482,10 @@ fn paint_bit_grid_lines(
             Stroke::new(0.5, BIT_BORDER_COLOR),
         );
     }
+}
+
+fn is_group_divider(bit_index: usize, group_width_bits: usize) -> bool {
+    group_width_bits > 0 && bit_index > 0 && bit_index % group_width_bits == 0
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5713,10 +5782,11 @@ fn text_pane_column_step(pane_kind: TextPaneKind, text_char_width: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        BitViewerApp, DrawGranularity, GraphViewport, TextPaneKind,
+        BitViewerApp, DEFAULT_GRID_GROUP_BITS, DrawGranularity, GraphViewport, TextPaneKind,
         autocorrelation_width_from_global, draw_modifier_active, hover_bit_col_in_bit_grid,
-        hover_byte_col_in_text_pane, pointer_bit_col_in_bit_grid, pointer_byte_col_in_text_pane,
-        pointer_row_in_scroll_pane, run_histogram_width_from_global, zoom_graph_axis,
+        hover_byte_col_in_text_pane, is_group_divider, pointer_bit_col_in_bit_grid,
+        pointer_byte_col_in_text_pane, pointer_row_in_scroll_pane, run_histogram_width_from_global,
+        zoom_graph_axis,
     };
     use eframe::egui::{Modifiers, Rect, pos2};
 
@@ -5899,6 +5969,33 @@ mod tests {
         assert!(app.submit_row_width_prompt());
         assert_eq!(app.row_width_bits, 256);
         assert_eq!(app.target_row_width_bits, 256);
+    }
+
+    #[test]
+    fn grid_group_setting_defaults_to_eight_bits() {
+        let app = BitViewerApp::default();
+
+        assert_eq!(app.bit_grid_group_bits, DEFAULT_GRID_GROUP_BITS);
+    }
+
+    #[test]
+    fn bit_grid_group_input_accepts_one_bit() {
+        let mut app = BitViewerApp::default();
+        app.bit_grid_group_input = "1".to_owned();
+
+        app.apply_bit_grid_group_input(true);
+
+        assert_eq!(app.bit_grid_group_bits, 1);
+        assert_eq!(app.bit_grid_group_input, "1");
+    }
+
+    #[test]
+    fn group_divider_uses_selected_grid_width() {
+        assert!(is_group_divider(8, 8));
+        assert!(!is_group_divider(12, 8));
+        assert!(is_group_divider(16, 4));
+        assert!(!is_group_divider(0, 8));
+        assert!(!is_group_divider(8, 0));
     }
 
     #[test]
