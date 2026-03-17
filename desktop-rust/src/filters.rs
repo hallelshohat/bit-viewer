@@ -1,4 +1,6 @@
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FilterPipeline {
     pub steps: Vec<FilterStep>,
 }
@@ -9,7 +11,7 @@ impl FilterPipeline {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum L2Protocol {
     #[default]
     Ethernet,
@@ -64,7 +66,7 @@ impl L2Protocol {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FilterStep {
     SyncOnPreamble {
         bits: String,
@@ -106,7 +108,7 @@ pub enum FilterStep {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupChunkRange {
     pub start_chunk: usize,
     pub end_chunk: usize,

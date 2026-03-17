@@ -18,6 +18,7 @@ use crate::autocorrelation::{
     AutoCorrelationResult, analyze_width_autocorrelation_limited_with_progress,
     autocorrelation_width_limit_limited,
 };
+use crate::custom_filters::{CustomFilterPreset, load_custom_filters, save_custom_filters};
 use crate::document::BinaryDocument;
 use crate::export::{
     ExportFormat, LinkTypeOption, PcapExportOptions, WAV_CODEC_PRESETS, WavExportOptions,
@@ -46,9 +47,12 @@ const MAX_AUTOCORRELATION_SAMPLE_BYTES: usize = 64 * 1_048_576;
 const AUTOCORRELATION_WINDOW_WIDTH: f32 = 640.0;
 const AUTOCORRELATION_WINDOW_DEFAULT_HEIGHT: f32 = 420.0;
 const AUTOCORRELATION_WINDOW_MIN_HEIGHT: f32 = 320.0;
-const FILTER_WINDOW_WIDTH: f32 = 560.0;
+const FILTER_WINDOW_WIDTH: f32 = 980.0;
+const FILTER_WINDOW_COLLAPSED_WIDTH: f32 = 560.0;
 const FILTER_WINDOW_DEFAULT_HEIGHT: f32 = 620.0;
 const FILTER_WINDOW_MIN_HEIGHT: f32 = 420.0;
+const FILTER_WINDOW_COLLAPSED_MIN_WIDTH: f32 = 560.0;
+const FILTER_WINDOW_MIN_WIDTH: f32 = 860.0;
 const AUTOCORRELATION_GRAPH_MIN_WIDTH: f32 = 280.0;
 const AUTOCORRELATION_GRAPH_MAX_WIDTH: f32 = 520.0;
 const RUN_HISTOGRAM_WINDOW_WIDTH: f32 = 700.0;
@@ -323,8 +327,12 @@ pub struct BitViewerApp {
     run_histogram_cancel: Option<Arc<AtomicBool>>,
     show_export_window: bool,
     show_filters_window: bool,
+    show_custom_filters_pane: bool,
     filter_command_input: String,
     filter_command_feedback: Option<CommandFeedback>,
+    custom_filters: Vec<CustomFilterPreset>,
+    custom_filter_name_input: String,
+    custom_filter_feedback: Option<CommandFeedback>,
     focus_filter_command_input: bool,
     show_row_width_prompt: bool,
     row_width_prompt_input: String,
@@ -409,8 +417,12 @@ impl Default for BitViewerApp {
             run_histogram_cancel: None,
             show_export_window: false,
             show_filters_window: false,
+            show_custom_filters_pane: false,
             filter_command_input: String::new(),
             filter_command_feedback: None,
+            custom_filters: Vec::new(),
+            custom_filter_name_input: String::new(),
+            custom_filter_feedback: None,
             focus_filter_command_input: false,
             show_row_width_prompt: false,
             row_width_prompt_input: String::new(),
@@ -442,6 +454,9 @@ impl BitViewerApp {
     pub fn new(cc: &eframe::CreationContext<'_>, initial_path: Option<PathBuf>) -> Self {
         Self::configure_theme(&cc.egui_ctx);
         let mut app = Self::default();
+        if let Err(error) = app.load_custom_filters_from_disk() {
+            app.last_error = Some(error);
+        }
         if let Some(path) = initial_path {
             app.load_document(path);
         }
@@ -2092,6 +2107,16 @@ impl BitViewerApp {
                 );
             });
             ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                if ui
+                    .small_button(if self.show_custom_filters_pane {
+                        "Hide saved presets"
+                    } else {
+                        "Saved presets"
+                    })
+                    .clicked()
+                {
+                    self.show_custom_filters_pane = !self.show_custom_filters_pane;
+                }
                 if ui.small_button("Help").clicked() {
                     self.show_filter_help = true;
                 }
@@ -2445,7 +2470,7 @@ impl BitViewerApp {
             );
             ui.label(
                 RichText::new(
-                    "Type a command such as `split 256`, `scramble 0x7f x^7+x^3+1`, or `extract ethernet`. Press Tab to complete the command name.",
+                    "Type a command such as `split 256`, `scramble 0x7f x^7+x^3+1`, `extract ethernet`, or a saved preset name. Press Tab to complete built-in filters and preset names.",
                 )
                 .small()
                 .color(TEXT_MUTED),
@@ -2455,8 +2480,7 @@ impl BitViewerApp {
                 let filter_command_id = ui.make_persistent_id("filter-command-input");
                 if ui.memory(|memory| memory.has_focus(filter_command_id))
                     && ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Tab))
-                    && let Some(completed) =
-                        complete_filter_command(&self.filter_command_input)
+                    && let Some(completed) = self.complete_filter_input(&self.filter_command_input)
                 {
                     self.filter_command_input = completed;
                     if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), filter_command_id)
@@ -2474,7 +2498,7 @@ impl BitViewerApp {
                     egui::TextEdit::singleline(&mut self.filter_command_input)
                         .id(filter_command_id)
                         .lock_focus(true)
-                        .hint_text("split 256"),
+                        .hint_text("split 256 or Packet sync"),
                 );
                 if self.focus_filter_command_input {
                     response.request_focus();
@@ -2509,7 +2533,151 @@ impl BitViewerApp {
                     }
                 });
             }
+
+            let custom_suggestions =
+                self.custom_filter_command_suggestions(&self.filter_command_input);
+            if !custom_suggestions.is_empty() {
+                ui.add_space(6.0);
+                ui.label(RichText::new("Custom presets").small().color(TEXT_MUTED));
+                ui.horizontal_wrapped(|ui| {
+                    for suggestion in custom_suggestions.into_iter().take(6) {
+                        if ui.small_button(&suggestion).clicked() {
+                            self.filter_command_input = suggestion;
+                            self.filter_command_feedback = None;
+                            self.focus_filter_command_input = true;
+                        }
+                    }
+                });
+            }
         });
+
+        changed
+    }
+
+    fn show_custom_filter_library(&mut self, ui: &mut Ui) -> bool {
+        let mut changed = false;
+        let mut replace_pipeline = None;
+        let mut append_pipeline = None;
+        let mut delete_preset = None;
+
+        self.compact_card_frame(SURFACE_ALT_BG).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("Custom Filters").strong().color(TEXT_PRIMARY));
+                    ui.label(
+                        RichText::new(
+                            "Save the current pipeline as a named preset, then reload or append it later.",
+                        )
+                        .small()
+                        .color(TEXT_MUTED),
+                    );
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.small_button("Close").clicked() {
+                        self.show_custom_filters_pane = false;
+                    }
+                });
+            });
+            ui.add_space(8.0);
+
+            ui.horizontal(|ui| {
+                let response = ui.add_sized(
+                    [ui.available_width() - 118.0, 32.0],
+                    egui::TextEdit::singleline(&mut self.custom_filter_name_input)
+                        .hint_text("Packet sync"),
+                );
+                if response.changed() {
+                    self.custom_filter_feedback = None;
+                }
+                if ui
+                    .add_enabled(
+                        !self.pipeline.steps.is_empty(),
+                        egui::Button::new("Save current"),
+                    )
+                    .clicked()
+                {
+                    self.save_current_pipeline_as_custom_filter();
+                }
+            });
+
+            if let Some(feedback) = self.custom_filter_feedback.as_ref() {
+                self.show_command_feedback(ui, feedback);
+            }
+
+            if self.custom_filters.is_empty() {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("No custom filters saved yet.")
+                        .small()
+                        .color(TEXT_MUTED),
+                );
+            } else {
+                ui.add_space(8.0);
+                for (index, preset) in self.custom_filters.iter().enumerate() {
+                    self.compact_card_frame(SURFACE_SUBTLE_BG).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new(&preset.name).strong().color(TEXT_PRIMARY));
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} step(s)",
+                                        preset.pipeline.steps.len()
+                                    ))
+                                    .small()
+                                    .color(TEXT_MUTED),
+                                );
+                            });
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.small_button("Delete").clicked() {
+                                    delete_preset = Some(index);
+                                }
+                                if ui.small_button("Append").clicked() {
+                                    append_pipeline = Some(index);
+                                }
+                                if ui.small_button("Use").clicked() {
+                                    replace_pipeline = Some(index);
+                                }
+                            });
+                        });
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(Self::custom_filter_summary(&preset.pipeline))
+                                .small()
+                                .color(TEXT_MUTED),
+                        );
+                    });
+                    ui.add_space(6.0);
+                }
+            }
+        });
+
+        if let Some(index) = replace_pipeline {
+            self.pipeline = self.custom_filters[index].pipeline.clone();
+            self.custom_filter_feedback = Some(CommandFeedback {
+                message: format!(
+                    "Loaded custom filter `{}`.",
+                    self.custom_filters[index].name
+                ),
+                is_error: false,
+            });
+            changed = true;
+        }
+
+        if let Some(index) = append_pipeline {
+            let preset = &self.custom_filters[index];
+            self.pipeline
+                .steps
+                .extend(preset.pipeline.steps.iter().cloned());
+            self.custom_filter_feedback = Some(CommandFeedback {
+                message: format!("Appended custom filter `{}`.", preset.name),
+                is_error: false,
+            });
+            changed = true;
+        }
+
+        if let Some(index) = delete_preset {
+            self.delete_custom_filter(index);
+        }
 
         changed
     }
@@ -2544,11 +2712,21 @@ impl BitViewerApp {
         let mut show_filters_window = self.show_filters_window;
         let mut close_requested = false;
         let mut rebuild_requested = false;
+        let window_width = if self.show_custom_filters_pane {
+            FILTER_WINDOW_WIDTH
+        } else {
+            FILTER_WINDOW_COLLAPSED_WIDTH
+        };
+        let min_window_width = if self.show_custom_filters_pane {
+            FILTER_WINDOW_MIN_WIDTH
+        } else {
+            FILTER_WINDOW_COLLAPSED_MIN_WIDTH
+        };
         egui::Window::new("Filters")
             .open(&mut show_filters_window)
-            .default_width(FILTER_WINDOW_WIDTH)
+            .default_width(window_width)
             .default_height(FILTER_WINDOW_DEFAULT_HEIGHT)
-            .min_width(FILTER_WINDOW_WIDTH)
+            .min_width(min_window_width)
             .min_height(FILTER_WINDOW_MIN_HEIGHT)
             .frame(
                 egui::Frame::new()
@@ -2561,14 +2739,39 @@ impl BitViewerApp {
                 if ui.input(|input| input.key_pressed(Key::Escape)) {
                     close_requested = true;
                 }
-                ScrollArea::vertical()
-                    .id_salt("filters-window-scroll")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        if self.show_filter_editor(ui) {
-                            rebuild_requested = true;
-                        }
+                if self.show_custom_filters_pane {
+                    ui.columns(2, |columns| {
+                        columns[0].spacing_mut().item_spacing.y = 10.0;
+                        columns[1].spacing_mut().item_spacing.y = 10.0;
+
+                        ScrollArea::vertical()
+                            .id_salt("filters-window-pipeline-scroll")
+                            .auto_shrink([false, false])
+                            .show(&mut columns[0], |ui| {
+                                if self.show_filter_editor(ui) {
+                                    rebuild_requested = true;
+                                }
+                            });
+
+                        ScrollArea::vertical()
+                            .id_salt("filters-window-custom-scroll")
+                            .auto_shrink([false, false])
+                            .show(&mut columns[1], |ui| {
+                                if self.show_custom_filter_library(ui) {
+                                    rebuild_requested = true;
+                                }
+                            });
                     });
+                } else {
+                    ScrollArea::vertical()
+                        .id_salt("filters-window-pipeline-scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            if self.show_filter_editor(ui) {
+                                rebuild_requested = true;
+                            }
+                        });
+                }
             });
 
         if rebuild_requested {
@@ -4570,6 +4773,198 @@ impl BitViewerApp {
         self.filter_command_feedback = None;
     }
 
+    fn complete_filter_input(&self, input: &str) -> Option<String> {
+        let builtin_completion = complete_filter_command(input);
+        let custom_completion = self.complete_custom_filter_name(input);
+
+        match (builtin_completion, custom_completion) {
+            (Some(builtin), Some(custom)) if builtin == custom => Some(builtin),
+            (Some(_), Some(custom)) if !self.input_starts_with_builtin_command_name(input) => {
+                Some(custom)
+            }
+            (Some(_), Some(_)) => None,
+            (Some(builtin), None) => Some(builtin),
+            (None, Some(custom)) => Some(custom),
+            (None, None) => None,
+        }
+    }
+
+    fn input_starts_with_builtin_command_name(&self, input: &str) -> bool {
+        let query = input.trim().to_ascii_lowercase();
+        !query.is_empty()
+            && filter_command_specs()
+                .iter()
+                .any(|spec| spec.name.starts_with(&query))
+    }
+
+    fn complete_custom_filter_name(&self, input: &str) -> Option<String> {
+        let trimmed_start = input.trim_start();
+        if trimmed_start.is_empty() {
+            return None;
+        }
+
+        let leading_whitespace = &input[..input.len().saturating_sub(trimmed_start.len())];
+        let query = trimmed_start.trim();
+        if query.is_empty() {
+            return None;
+        }
+
+        let normalized_query = query.to_ascii_lowercase();
+        let mut matches = self
+            .custom_filters
+            .iter()
+            .filter_map(|preset| {
+                let normalized_name = preset.name.to_ascii_lowercase();
+                (normalized_name.starts_with(&normalized_query)
+                    && normalized_name != normalized_query)
+                    .then(|| format!("{leading_whitespace}{}", preset.name))
+            })
+            .collect::<Vec<_>>();
+
+        matches.sort_unstable();
+        matches.dedup();
+        if matches.len() == 1 {
+            matches.into_iter().next()
+        } else {
+            None
+        }
+    }
+
+    fn custom_filter_command_suggestions(&self, input: &str) -> Vec<String> {
+        let query = input.trim().to_ascii_lowercase();
+        self.custom_filters
+            .iter()
+            .filter(|preset| query.is_empty() || preset.name.to_ascii_lowercase().contains(&query))
+            .map(|preset| preset.name.clone())
+            .collect()
+    }
+
+    fn parse_custom_filter_command(
+        &self,
+        input: &str,
+    ) -> Result<Option<CustomFilterPreset>, String> {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+
+        let Some(preset) = self
+            .custom_filters
+            .iter()
+            .find(|preset| preset.name.eq_ignore_ascii_case(trimmed))
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(preset.clone()))
+    }
+
+    fn load_custom_filters_from_disk(&mut self) -> Result<(), String> {
+        self.custom_filters = load_custom_filters()
+            .map_err(|error| format!("Failed to load custom filters: {error}"))?;
+        Ok(())
+    }
+
+    fn save_current_pipeline_as_custom_filter(&mut self) {
+        let name = self.custom_filter_name_input.trim().to_owned();
+        if name.is_empty() {
+            self.custom_filter_feedback = Some(CommandFeedback {
+                message: "Enter a custom filter name first.".to_owned(),
+                is_error: true,
+            });
+            return;
+        }
+
+        if self.pipeline.steps.is_empty() {
+            self.custom_filter_feedback = Some(CommandFeedback {
+                message: "Add at least one filter before saving a custom filter.".to_owned(),
+                is_error: true,
+            });
+            return;
+        }
+
+        let mut updated_filters = self.custom_filters.clone();
+        let preset = CustomFilterPreset {
+            name: name.clone(),
+            pipeline: self.pipeline.clone(),
+        };
+        let mut replaced = false;
+
+        if let Some(existing) = updated_filters
+            .iter_mut()
+            .find(|existing| existing.name.eq_ignore_ascii_case(&name))
+        {
+            *existing = preset;
+            replaced = true;
+        } else {
+            updated_filters.push(preset);
+        }
+
+        match save_custom_filters(&updated_filters) {
+            Ok(()) => {
+                self.custom_filters = updated_filters;
+                self.custom_filter_name_input.clear();
+                self.custom_filter_feedback = Some(CommandFeedback {
+                    message: if replaced {
+                        format!("Updated custom filter `{name}`.")
+                    } else {
+                        format!("Saved custom filter `{name}`.")
+                    },
+                    is_error: false,
+                });
+                self.last_error = None;
+            }
+            Err(error) => {
+                self.custom_filter_feedback = Some(CommandFeedback {
+                    message: error.clone(),
+                    is_error: true,
+                });
+                self.last_error = Some(error);
+            }
+        }
+    }
+
+    fn delete_custom_filter(&mut self, index: usize) {
+        let Some(existing) = self.custom_filters.get(index) else {
+            return;
+        };
+
+        let name = existing.name.clone();
+        let mut updated_filters = self.custom_filters.clone();
+        updated_filters.remove(index);
+
+        match save_custom_filters(&updated_filters) {
+            Ok(()) => {
+                self.custom_filters = updated_filters;
+                self.custom_filter_feedback = Some(CommandFeedback {
+                    message: format!("Deleted custom filter `{name}`."),
+                    is_error: false,
+                });
+                self.last_error = None;
+            }
+            Err(error) => {
+                self.custom_filter_feedback = Some(CommandFeedback {
+                    message: error.clone(),
+                    is_error: true,
+                });
+                self.last_error = Some(error);
+            }
+        }
+    }
+
+    fn custom_filter_summary(pipeline: &FilterPipeline) -> String {
+        if pipeline.steps.is_empty() {
+            return "Empty pipeline".to_owned();
+        }
+
+        pipeline
+            .steps
+            .iter()
+            .map(FilterStep::label)
+            .collect::<Vec<_>>()
+            .join(" -> ")
+    }
+
     fn open_row_width_prompt(&mut self) {
         self.show_row_width_prompt = true;
         self.row_width_prompt_input.clear();
@@ -4578,6 +4973,34 @@ impl BitViewerApp {
     }
 
     fn submit_filter_command(&mut self) -> bool {
+        match self.parse_custom_filter_command(&self.filter_command_input) {
+            Ok(Some(preset)) => {
+                let step_count = preset.pipeline.steps.len();
+                self.pipeline
+                    .steps
+                    .extend(preset.pipeline.steps.iter().cloned());
+                self.filter_command_input.clear();
+                self.filter_command_feedback = Some(CommandFeedback {
+                    message: format!(
+                        "Added custom filter `{}` ({} step(s)).",
+                        preset.name, step_count
+                    ),
+                    is_error: false,
+                });
+                self.focus_filter_command_input = true;
+                return true;
+            }
+            Ok(None) => {}
+            Err(message) => {
+                self.filter_command_feedback = Some(CommandFeedback {
+                    message,
+                    is_error: true,
+                });
+                self.focus_filter_command_input = true;
+                return false;
+            }
+        }
+
         match parse_filter_command(&self.filter_command_input) {
             Ok(step) => {
                 let label = step.label().to_owned();
@@ -5873,6 +6296,8 @@ mod tests {
         pointer_byte_col_in_text_pane, pointer_row_in_scroll_pane, run_histogram_width_from_global,
         zoom_graph_axis,
     };
+    use crate::custom_filters::CustomFilterPreset;
+    use crate::filters::{FilterPipeline, FilterStep};
     use eframe::egui::{Modifiers, Rect, pos2};
 
     #[test]
@@ -6072,6 +6497,52 @@ mod tests {
 
         assert_eq!(app.bit_grid_group_bits, 1);
         assert_eq!(app.bit_grid_group_input, "1");
+    }
+
+    #[test]
+    fn tab_completion_supports_custom_filter_names() {
+        let mut app = BitViewerApp::default();
+        app.custom_filters = vec![CustomFilterPreset {
+            name: "Packet sync".to_owned(),
+            pipeline: FilterPipeline {
+                steps: vec![FilterStep::Split {
+                    group_size_bits: 256,
+                }],
+            },
+        }];
+
+        assert_eq!(
+            app.complete_filter_input("Pack"),
+            Some("Packet sync".to_owned())
+        );
+    }
+
+    #[test]
+    fn submit_filter_command_accepts_exact_custom_filter_name() {
+        let mut app = BitViewerApp::default();
+        app.custom_filters = vec![CustomFilterPreset {
+            name: "Packet sync".to_owned(),
+            pipeline: FilterPipeline {
+                steps: vec![
+                    FilterStep::Split {
+                        group_size_bits: 256,
+                    },
+                    FilterStep::InvertBits,
+                ],
+            },
+        }];
+        app.filter_command_input = "Packet sync".to_owned();
+
+        assert!(app.submit_filter_command());
+        assert_eq!(
+            app.pipeline.steps,
+            vec![
+                FilterStep::Split {
+                    group_size_bits: 256,
+                },
+                FilterStep::InvertBits,
+            ]
+        );
     }
 
     #[test]

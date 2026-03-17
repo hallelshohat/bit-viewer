@@ -19,6 +19,7 @@
   - preamble sync
   - group length filtering
   - bit-range selection from each group
+- Named custom filter presets built from a saved filter pipeline.
 
 ## Why this is faster
 
@@ -48,5 +49,12 @@ cargo run --release
 - Linux: `cargo run --release`
 - Windows: `cargo run --release` or `cargo build --release`
 - Windows cross-compile from Linux: `cargo build --release --target x86_64-pc-windows-gnu`
+
+## Custom filters
+
+Custom filter presets are stored as JSON so they persist across launches.
+
+- Linux: `~/.config/bit-viewer-desktop/custom-filters.json`
+- Windows: `%APPDATA%\bit-viewer-desktop\custom-filters.json`
 
 The app stays a single native Rust codebase across both platforms.
