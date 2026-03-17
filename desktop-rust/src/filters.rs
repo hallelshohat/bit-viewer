@@ -73,7 +73,7 @@ pub enum FilterStep {
         group_size_bits: usize,
     },
     Chop {
-        bits: usize,
+        bits: i64,
     },
     ReverseBitsPerByte,
     InvertBits,
@@ -140,7 +140,7 @@ impl FilterStep {
                 "Flatten the current view, then cut it into fixed-size groups and keep any partial tail group."
             }
             Self::Chop { .. } => {
-                "Remove a fixed number of bits from the start of the file, or from the start of each group once groups exist."
+                "Remove bits from the start when the value is positive, or from the end when the value is negative. Once groups exist, apply the trim to each group."
             }
             Self::ReverseBitsPerByte => {
                 "Flip the bit order inside every byte without changing the byte positions."
@@ -198,8 +198,8 @@ const FILTER_COMMAND_SPECS: [FilterCommandSpec; 12] = [
     FilterCommandSpec {
         name: "chop",
         usage: "chop <bits>",
-        summary: "Remove bits from the start of the file or each group.",
-        example: "chop 8",
+        summary: "Remove bits from the start with positive values or from the end with negative values.",
+        example: "chop -8",
     },
     FilterCommandSpec {
         name: "reverse",
@@ -396,7 +396,7 @@ fn parse_filter_command_with_index(index: usize, arguments: &str) -> Result<Filt
             group_size_bits: parse_required_positive_usize(arguments, "split", 8)?,
         }),
         2 => Ok(FilterStep::Chop {
-            bits: parse_optional_usize(arguments, "chop", 8)?,
+            bits: parse_optional_i64(arguments, "chop", 8)?,
         }),
         3 => {
             reject_extra_arguments(arguments, "reverse")?;
@@ -502,6 +502,20 @@ fn parse_optional_usize(arguments: &str, command: &str, default: usize) -> Resul
         ));
     }
     Ok(values[0])
+}
+
+fn parse_optional_i64(arguments: &str, command: &str, default: i64) -> Result<i64, String> {
+    if arguments.trim().is_empty() {
+        return Ok(default);
+    }
+
+    let parts = split_numeric_arguments(arguments);
+    if parts.len() != 1 {
+        return Err(format!(
+            "`{command}` expects exactly one numeric parameter."
+        ));
+    }
+    parse_i64_token(parts[0], command)
 }
 
 fn parse_optional_u8(arguments: &str, command: &str, default: u8) -> Result<u8, String> {
@@ -642,6 +656,27 @@ fn parse_usize_token(token: &str, command: &str) -> Result<usize, String> {
     } else {
         token
             .parse::<usize>()
+            .map_err(|_| format!("`{command}` expects a valid number, got `{token}`."))
+    }
+}
+
+fn parse_i64_token(token: &str, command: &str) -> Result<i64, String> {
+    if let Some(hex) = token
+        .strip_prefix("-0x")
+        .or_else(|| token.strip_prefix("-0X"))
+    {
+        i64::from_str_radix(hex, 16)
+            .map(|value| -value)
+            .map_err(|_| format!("`{command}` expects a valid number, got `{token}`."))
+    } else if let Some(hex) = token
+        .strip_prefix("0x")
+        .or_else(|| token.strip_prefix("0X"))
+    {
+        i64::from_str_radix(hex, 16)
+            .map_err(|_| format!("`{command}` expects a valid number, got `{token}`."))
+    } else {
+        token
+            .parse::<i64>()
             .map_err(|_| format!("`{command}` expects a valid number, got `{token}`."))
     }
 }
@@ -905,6 +940,15 @@ impl PipelineState {
     }
 }
 
+fn chop_buffer(buffer: &BitBuffer, bits: i64) -> BitBuffer {
+    let amount = usize::try_from(bits.unsigned_abs()).unwrap_or(usize::MAX);
+    if bits >= 0 {
+        buffer.slice_bits(amount, buffer.len_bits().saturating_sub(amount))
+    } else {
+        buffer.slice_bits(0, buffer.len_bits().saturating_sub(amount))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LfsrConfig {
     seed: u64,
@@ -1129,13 +1173,11 @@ fn apply_step(state: PipelineState, step: &FilterStep) -> Result<PipelineState, 
             Ok(PipelineState::Grouped(groups))
         }
         FilterStep::Chop { bits } => match state {
-            PipelineState::Flat(buffer) => Ok(PipelineState::Flat(
-                buffer.slice_bits(*bits, buffer.len_bits().saturating_sub(*bits)),
-            )),
+            PipelineState::Flat(buffer) => Ok(PipelineState::Flat(chop_buffer(&buffer, *bits))),
             PipelineState::Grouped(groups) => Ok(PipelineState::Grouped(
                 groups
                     .into_iter()
-                    .map(|group| group.slice_bits(*bits, group.len_bits().saturating_sub(*bits)))
+                    .map(|group| chop_buffer(&group, *bits))
                     .filter(|group| !group.is_empty())
                     .collect(),
             )),
@@ -2009,6 +2051,18 @@ mod tests {
     }
 
     #[test]
+    fn chop_with_negative_value_removes_suffix_once_when_input_is_still_flat() {
+        let bytes = [0b1101_0011];
+        let pipeline = FilterPipeline {
+            steps: vec![FilterStep::Chop { bits: -3 }],
+        };
+
+        let view = build_derived_view(&bytes, &pipeline).expect("pipeline should succeed");
+
+        assert_eq!(group_bits(&view), vec![vec![1, 1, 0, 1, 0]]);
+    }
+
+    #[test]
     fn chop_removes_prefix_from_each_existing_group() {
         let groups = vec![vec![0xAA], vec![0x55, 0xF0]];
         let pipeline = FilterPipeline {
@@ -2021,6 +2075,22 @@ mod tests {
         assert_eq!(
             group_bits(&view),
             vec![vec![1, 0, 1, 0], vec![0, 1, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0],]
+        );
+    }
+
+    #[test]
+    fn chop_with_negative_value_removes_suffix_from_each_existing_group() {
+        let groups = vec![vec![0xAA], vec![0x55, 0xF0]];
+        let pipeline = FilterPipeline {
+            steps: vec![FilterStep::Chop { bits: -4 }],
+        };
+
+        let view = super::build_derived_view_from_groups(&groups, &pipeline)
+            .expect("pipeline should succeed");
+
+        assert_eq!(
+            group_bits(&view),
+            vec![vec![1, 0, 1, 0], vec![0, 1, 0, 1, 0, 1, 0, 1, 1, 1, 1, 1],]
         );
     }
 
@@ -2140,6 +2210,10 @@ mod tests {
         assert_eq!(
             super::parse_filter_command("chop").expect("chop should use its default"),
             FilterStep::Chop { bits: 8 }
+        );
+        assert_eq!(
+            super::parse_filter_command("chop -8").expect("negative chop should parse"),
+            FilterStep::Chop { bits: -8 }
         );
         assert_eq!(
             super::parse_filter_command("select 12, 24").expect("select should parse two values"),

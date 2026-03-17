@@ -2173,12 +2173,7 @@ impl BitViewerApp {
                             .spacing(egui::vec2(12.0, 10.0))
                             .show(ui, |ui| {
                                 ui.label(RichText::new("Bits").color(TEXT_MUTED));
-                                if ui
-                                    .add(
-                                        egui::DragValue::new(bits).range(0..=usize::MAX).speed(1.0),
-                                    )
-                                    .changed()
-                                {
+                                if ui.add(egui::DragValue::new(bits).speed(1.0)).changed() {
                                     changed = true;
                                 }
                                 ui.end_row();
