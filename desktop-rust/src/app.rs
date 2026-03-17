@@ -24,7 +24,7 @@ use crate::export::{
     default_export_file_name, export_flattened_bits, export_pcap, export_wav, known_link_types,
 };
 use crate::filters::{
-    CachedFilterState, DerivedView, FilterPipeline, FilterStep, L2Protocol,
+    CachedFilterState, DerivedView, FilterPipeline, FilterStep, GroupChunkRange, L2Protocol,
     append_filter_to_cached_state, complete_filter_command, filter_command_specs,
     filter_command_suggestions, parse_filter_command,
 };
@@ -2298,6 +2298,96 @@ impl BitViewerApp {
                                 }
                                 ui.end_row();
                             });
+                    }
+                    FilterStep::SelectSubgroupRangesFromGroup {
+                        chunk_count,
+                        subgroup_size_bits,
+                        subgroup_ranges,
+                    } => {
+                        egui::Grid::new(("select-subgroups-grid", index))
+                            .num_columns(2)
+                            .spacing(egui::vec2(12.0, 10.0))
+                            .show(ui, |ui| {
+                                ui.label(RichText::new("Virtual chunks").color(TEXT_MUTED));
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(chunk_count)
+                                            .range(1..=usize::MAX)
+                                            .speed(1.0),
+                                    )
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
+                                ui.end_row();
+
+                                ui.label(RichText::new("Bits per chunk").color(TEXT_MUTED));
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(subgroup_size_bits)
+                                            .range(1..=usize::MAX)
+                                            .speed(1.0),
+                                    )
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
+                                ui.end_row();
+                            });
+
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Ranges (zero-based)").color(TEXT_MUTED));
+                            if ui.small_button("Add range").clicked() {
+                                subgroup_ranges.push(GroupChunkRange {
+                                    start_chunk: 0,
+                                    end_chunk: 0,
+                                });
+                                changed = true;
+                            }
+                        });
+
+                        let mut remove_range = None;
+                        let allow_remove = subgroup_ranges.len() > 1;
+                        for (range_index, range) in subgroup_ranges.iter_mut().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(format!("#{}", range_index + 1))
+                                        .small()
+                                        .color(TEXT_MUTED),
+                                );
+                                ui.label(RichText::new("Start").color(TEXT_MUTED));
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(&mut range.start_chunk)
+                                            .range(0..=usize::MAX)
+                                            .speed(1.0),
+                                    )
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
+                                ui.label(RichText::new("End").color(TEXT_MUTED));
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(&mut range.end_chunk)
+                                            .range(0..=usize::MAX)
+                                            .speed(1.0),
+                                    )
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
+                                if allow_remove && ui.small_button("Delete").clicked() {
+                                    remove_range = Some(range_index);
+                                }
+                            });
+                        }
+
+                        if let Some(range_index) = remove_range {
+                            subgroup_ranges.remove(range_index);
+                            changed = true;
+                        }
                     }
                     FilterStep::ExtractL2Packets { protocol } => {
                         egui::Grid::new(("extract-l2-grid", index))

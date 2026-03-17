@@ -96,9 +96,20 @@ pub enum FilterStep {
         start_bit: usize,
         length_bits: usize,
     },
+    SelectSubgroupRangesFromGroup {
+        chunk_count: usize,
+        subgroup_size_bits: usize,
+        subgroup_ranges: Vec<GroupChunkRange>,
+    },
     ExtractL2Packets {
         protocol: L2Protocol,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GroupChunkRange {
+    pub start_chunk: usize,
+    pub end_chunk: usize,
 }
 
 impl FilterStep {
@@ -115,6 +126,7 @@ impl FilterStep {
             Self::Flatten => "Flatten groups",
             Self::KeepGroupsLongerThanBytes { .. } => "Keep groups longer than bytes",
             Self::SelectBitRangeFromGroup { .. } => "Select bit range from group",
+            Self::SelectSubgroupRangesFromGroup { .. } => "Select subgroup ranges from group",
             Self::ExtractL2Packets { .. } => "Extract L2 packets",
         }
     }
@@ -150,7 +162,10 @@ impl FilterStep {
                 "Drop any group whose length is not greater than the configured byte threshold."
             }
             Self::SelectBitRangeFromGroup { .. } => {
-                "Keep only a fixed bit range from each group and discard the rest."
+                "Keep only a fixed bit range from each group and discard the rest. The `select` command can also keep ranges of fixed-size virtual subgroups."
+            }
+            Self::SelectSubgroupRangesFromGroup { .. } => {
+                "Split each group into fixed-size virtual subgroups, keep the requested subgroup ranges, and concatenate them back into one group."
             }
             Self::ExtractL2Packets { .. } => {
                 "Split the current stream into packet groups using Ethernet preambles, PPP byte-stuffed flags, or HDLC-family bit-stuffed flags."
@@ -230,9 +245,9 @@ const FILTER_COMMAND_SPECS: [FilterCommandSpec; 12] = [
     },
     FilterCommandSpec {
         name: "select",
-        usage: "select <start_bit> <length_bits>",
-        summary: "Keep a fixed bit range from each group.",
-        example: "select 0 48",
+        usage: "select <start_bit> <length_bits> | <chunks>*<bits_per_chunk> <ranges>",
+        summary: "Keep a fixed bit range from each group, or keep and concatenate ranges of virtual subgroups.",
+        example: "select 32*8 1-16,17-31",
     },
     FilterCommandSpec {
         name: "extract",
@@ -409,20 +424,49 @@ fn parse_filter_command_with_index(index: usize, arguments: &str) -> Result<Filt
         9 => Ok(FilterStep::KeepGroupsLongerThanBytes {
             min_bytes: parse_optional_usize(arguments, "keep", 6)?,
         }),
-        10 => {
-            let [start_bit, length_bits] = parse_usize_list(arguments, "select", &[0, 48])?
-                .try_into()
-                .expect("select should produce exactly two values");
-            Ok(FilterStep::SelectBitRangeFromGroup {
-                start_bit,
-                length_bits,
-            })
-        }
+        10 => parse_select_arguments(arguments),
         11 => Ok(FilterStep::ExtractL2Packets {
             protocol: parse_l2_protocol(arguments)?,
         }),
         _ => Err("Unknown filter command.".to_owned()),
     }
+}
+
+fn parse_select_arguments(arguments: &str) -> Result<FilterStep, String> {
+    let trimmed = arguments.trim();
+    if trimmed.is_empty() {
+        return Ok(FilterStep::SelectBitRangeFromGroup {
+            start_bit: 0,
+            length_bits: 48,
+        });
+    }
+
+    let Some((first_token, remainder)) = trimmed.split_once(char::is_whitespace) else {
+        return Err(
+            "`select` expects either `<start_bit> <length_bits>` or `<chunks>*<bits_per_chunk> <ranges>`."
+                .to_owned(),
+        );
+    };
+
+    if let Some((chunk_count_token, subgroup_size_token)) = first_token.split_once('*') {
+        let chunk_count = parse_usize_token(chunk_count_token.trim(), "select")?;
+        let subgroup_size_bits = parse_usize_token(subgroup_size_token.trim(), "select")?;
+        let subgroup_ranges = parse_group_chunk_ranges(remainder, chunk_count)?;
+        validate_select_subgroup_ranges(chunk_count, subgroup_size_bits, &subgroup_ranges)?;
+        return Ok(FilterStep::SelectSubgroupRangesFromGroup {
+            chunk_count,
+            subgroup_size_bits,
+            subgroup_ranges,
+        });
+    }
+
+    let [start_bit, length_bits] = parse_usize_list(arguments, "select", &[0, 48])?
+        .try_into()
+        .expect("select should produce exactly two values");
+    Ok(FilterStep::SelectBitRangeFromGroup {
+        start_bit,
+        length_bits,
+    })
 }
 
 fn reject_extra_arguments(arguments: &str, command: &str) -> Result<(), String> {
@@ -500,6 +544,85 @@ fn parse_usize_list(
         .into_iter()
         .map(|part| parse_usize_token(part, command))
         .collect()
+}
+
+fn parse_group_chunk_ranges(
+    arguments: &str,
+    chunk_count: usize,
+) -> Result<Vec<GroupChunkRange>, String> {
+    let trimmed = arguments.trim();
+    if trimmed.is_empty() {
+        return Err("`select` expects subgroup ranges like `1-16,17-31`.".to_owned());
+    }
+
+    let mut ranges = Vec::new();
+    for token in trimmed.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+
+        let (start_chunk, end_chunk) = if let Some((start, end)) = token.split_once('-') {
+            (
+                parse_usize_token(start.trim(), "select")?,
+                parse_usize_token(end.trim(), "select")?,
+            )
+        } else {
+            let index = parse_usize_token(token, "select")?;
+            (index, index)
+        };
+
+        if start_chunk > end_chunk {
+            return Err(format!(
+                "`select` subgroup range `{token}` must have start <= end."
+            ));
+        }
+        if end_chunk >= chunk_count {
+            return Err(format!(
+                "`select` subgroup indexes are zero-based and must be smaller than {chunk_count}."
+            ));
+        }
+
+        ranges.push(GroupChunkRange {
+            start_chunk,
+            end_chunk,
+        });
+    }
+
+    if ranges.is_empty() {
+        return Err("`select` expects at least one subgroup range.".to_owned());
+    }
+
+    Ok(ranges)
+}
+
+fn validate_select_subgroup_ranges(
+    chunk_count: usize,
+    subgroup_size_bits: usize,
+    subgroup_ranges: &[GroupChunkRange],
+) -> Result<(), String> {
+    if chunk_count == 0 {
+        return Err("`select` requires at least one subgroup.".to_owned());
+    }
+    if subgroup_size_bits == 0 {
+        return Err("`select` requires a subgroup size greater than zero bits.".to_owned());
+    }
+    if subgroup_ranges.is_empty() {
+        return Err("`select` requires at least one subgroup range.".to_owned());
+    }
+
+    for range in subgroup_ranges {
+        if range.start_chunk > range.end_chunk {
+            return Err("`select` subgroup ranges must have start <= end.".to_owned());
+        }
+        if range.end_chunk >= chunk_count {
+            return Err(format!(
+                "`select` subgroup indexes are zero-based and must be smaller than {chunk_count}."
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn split_numeric_arguments(arguments: &str) -> Vec<&str> {
@@ -1078,6 +1201,41 @@ fn apply_step(state: PipelineState, step: &FilterStep) -> Result<PipelineState, 
                     .collect(),
             )),
         },
+        FilterStep::SelectSubgroupRangesFromGroup {
+            chunk_count,
+            subgroup_size_bits,
+            subgroup_ranges,
+        } => match state {
+            PipelineState::Flat(_) => Err(
+                "Select-range filter requires a grouping step earlier in the pipeline.".to_owned(),
+            ),
+            PipelineState::Grouped(groups) => {
+                validate_select_subgroup_ranges(
+                    *chunk_count,
+                    *subgroup_size_bits,
+                    subgroup_ranges,
+                )?;
+                Ok(PipelineState::Grouped(
+                    groups
+                        .into_iter()
+                        .map(|group| {
+                            let selected_chunks = subgroup_ranges
+                                .iter()
+                                .flat_map(|range| range.start_chunk..=range.end_chunk)
+                                .map(|chunk_index| {
+                                    group.slice_bits(
+                                        chunk_index.saturating_mul(*subgroup_size_bits),
+                                        *subgroup_size_bits,
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                            BitBuffer::concatenate(&selected_chunks)
+                        })
+                        .filter(|group| !group.is_empty())
+                        .collect(),
+                ))
+            }
+        },
         FilterStep::ExtractL2Packets { protocol } => extract_l2_packets(state, *protocol),
     }
 }
@@ -1582,8 +1740,9 @@ fn mask_unused_tail_bits(bytes: &mut [u8], bit_len: usize) {
 #[cfg(test)]
 mod tests {
     use super::{
-        DerivedView, FilterPipeline, FilterStep, L2Protocol, append_filter_to_cached_state,
-        build_cached_filter_state, build_derived_view, parse_preamble_bits,
+        DerivedView, FilterPipeline, FilterStep, GroupChunkRange, L2Protocol,
+        append_filter_to_cached_state, build_cached_filter_state, build_derived_view,
+        parse_preamble_bits,
     };
 
     fn group_bits(view: &DerivedView) -> Vec<Vec<u8>> {
@@ -1759,6 +1918,39 @@ mod tests {
     }
 
     #[test]
+    fn select_subgroup_ranges_concatenates_requested_virtual_chunks() {
+        let bytes = [0b1111_0000, 0b1010_0101];
+        let pipeline = FilterPipeline {
+            steps: vec![
+                FilterStep::Split {
+                    group_size_bits: 16,
+                },
+                FilterStep::SelectSubgroupRangesFromGroup {
+                    chunk_count: 4,
+                    subgroup_size_bits: 4,
+                    subgroup_ranges: vec![
+                        GroupChunkRange {
+                            start_chunk: 1,
+                            end_chunk: 2,
+                        },
+                        GroupChunkRange {
+                            start_chunk: 3,
+                            end_chunk: 3,
+                        },
+                    ],
+                },
+            ],
+        };
+
+        let view = build_derived_view(&bytes, &pipeline).expect("pipeline should succeed");
+
+        assert_eq!(
+            group_bits(&view),
+            vec![vec![0, 0, 0, 0, 1, 0, 1, 0, 0, 1, 0, 1]]
+        );
+    }
+
+    #[test]
     fn flatten_concatenates_all_groups_into_one_group() {
         let bytes = [0b1010_0001, 0b1010_1111];
         let pipeline = FilterPipeline {
@@ -1864,6 +2056,29 @@ mod tests {
     }
 
     #[test]
+    fn select_subgroup_ranges_rejects_invalid_indexes() {
+        let bytes = [0b1111_0000, 0b1010_0101];
+        let pipeline = FilterPipeline {
+            steps: vec![
+                FilterStep::Split {
+                    group_size_bits: 16,
+                },
+                FilterStep::SelectSubgroupRangesFromGroup {
+                    chunk_count: 4,
+                    subgroup_size_bits: 4,
+                    subgroup_ranges: vec![GroupChunkRange {
+                        start_chunk: 1,
+                        end_chunk: 4,
+                    }],
+                },
+            ],
+        };
+
+        let error = build_derived_view(&bytes, &pipeline).expect_err("pipeline should fail");
+        assert!(error.contains("zero-based"));
+    }
+
+    #[test]
     fn append_filter_to_cached_state_matches_full_rebuild() {
         let bytes = [0b1010_0001, 0b1010_1111, 0b1010_0010];
         let base_pipeline = FilterPipeline {
@@ -1931,6 +2146,24 @@ mod tests {
             FilterStep::SelectBitRangeFromGroup {
                 start_bit: 12,
                 length_bits: 24,
+            }
+        );
+        assert_eq!(
+            super::parse_filter_command("select 32*8 1-16,17-31")
+                .expect("chunked select should parse"),
+            FilterStep::SelectSubgroupRangesFromGroup {
+                chunk_count: 32,
+                subgroup_size_bits: 8,
+                subgroup_ranges: vec![
+                    GroupChunkRange {
+                        start_chunk: 1,
+                        end_chunk: 16,
+                    },
+                    GroupChunkRange {
+                        start_chunk: 17,
+                        end_chunk: 31,
+                    },
+                ],
             }
         );
     }
